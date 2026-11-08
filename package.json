@@ -16,7 +16,7 @@
     "check": "oxfmt --check packages tests package.json .oxfmtrc.json .vscode"
   },
   "devDependencies": {
-    "@types/bun": "^1.4.2",
+    "@types/bun": "^1.4.4",
     "@types/node": "^26.5.0",
     "git-cliff": "^2.13.1",
     "kill-port": "^2.0.1",
