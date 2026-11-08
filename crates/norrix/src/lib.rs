@@ -1,0 +1,5 @@
+//! Norrix's process entrypoint and diagnostics.
+
+pub mod panic;
+pub mod sentry;
+pub mod tracing;

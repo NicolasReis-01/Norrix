@@ -1,0 +1,21 @@
+[package]
+name = "norrix-psd"
+version.workspace = true
+edition.workspace = true
+description.workspace = true
+license.workspace = true
+authors.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+publish.workspace = true
+
+[dependencies]
+image = { workspace = true }
+norrix-renderer = { workspace = true }
+norrix-rasterizer = { workspace = true, features = ["native"] }
+norrix-scene = { workspace = true }
+thiserror = { workspace = true }
+tokio-rayon = { workspace = true }
+tracing = { workspace = true }

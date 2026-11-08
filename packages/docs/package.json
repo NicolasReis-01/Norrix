@@ -1,0 +1,14 @@
+{
+  "name": "@norrix/docs",
+  "private": true,
+  "scripts": {
+    "predev": "bun ../../scripts/generate-icons.mjs",
+    "dev": "mint dev --port 3001 --no-open"
+  },
+  "devDependencies": {
+    "mint": "4.2.882"
+  },
+  "engines": {
+    "node": "^24.0.0"
+  }
+}

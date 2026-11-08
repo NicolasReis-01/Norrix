@@ -1,0 +1,25 @@
+{
+  "name": "@norrix/bridge",
+  "version": "0.1.0",
+  "private": true,
+  "license": "MIT OR Apache-2.0",
+  "type": "module",
+  "exports": {
+    "./canvas": "./src/canvas.ts",
+    "./protocol": "./src/protocol.ts"
+  },
+  "scripts": {
+    "lint": "oxlint src --ignore-pattern src/protocol.ts --ignore-pattern src/wasm",
+    "typecheck": "tsc --noEmit",
+    "dev": "bun run scripts/dev.mjs",
+    "build": "bun run scripts/build.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "3.0.0-alpha.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.1.14",
+    "oxlint": "^1.82.0",
+    "typescript": "^7.0.2"
+  }
+}

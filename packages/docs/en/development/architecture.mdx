@@ -1,0 +1,69 @@
+---
+title: 'Architecture'
+description: 'Follow ownership from the React interface to scenes, processing, and native runtimes.'
+icon: 'sitemap'
+---
+
+Norrix runs as a desktop application. React invokes typed Tauri commands; native components own durable project state and processing.
+
+```mermaid
+flowchart TB
+  ui["packages/norrix: React + Next.js"] --> bridge["packages/bridge: protocol + WASM"]
+  entry["crates/norrix: startup"] --> app["norrix-app"]
+  bridge -->|"commands and channels"| app
+  app --> scene["norrix-scene"] --> storage["norrix-storage"]
+  app --> pipeline["norrix-pipeline"] --> ml["norrix-ml"] --> runtime["norrix-runtime"] --> native["native runtimes"]
+  app --> translator["norrix-translator"]
+  app --> agent["norrix-agent"]
+  app --> desktop["norrix-desktop"] --> renderer["norrix-renderer"] --> rasterizer["norrix-rasterizer"]
+  bridge --> canvas["norrix-canvas"] --> rasterizer
+  app --> psd["norrix-psd"] --> renderer
+  psd --> rasterizer
+```
+
+## Interface and application
+
+| Component         | Responsibility                                                                                                     |
+| ----------------- | ------------------------------------------------------------------------------------------------------------------ |
+| `packages/norrix` | Project browser, page rail, canvas controls, inspector, settings, activity, Agent, and transient interaction state |
+| `packages/ui`     | Shared React primitives and styling                                                                                |
+| `packages/bridge` | Generated Tauri protocol, browser canvas adapter, and derived WASM package                                         |
+| `crates/norrix`   | Startup, diagnostics, Tauri configuration, and build integration                                                   |
+| `norrix-app`      | Tauri state, project lifecycle, command serialization, jobs, synchronization, and Agent hosting                    |
+
+Independent typed channels carry project, canvas, job, download, and resource updates; Agent sign-in and runs stream through per-call channels. Preferences are fetched and saved through commands. The frontend does not use an HTTP client or a generic application event envelope.
+
+<Note>
+  Rust signatures generate `packages/bridge/src/protocol.ts`. Change the Rust source and [regenerate
+  bindings](/en/development/setup#regenerate-ipc-bindings).
+</Note>
+
+## Scene and processing
+
+`norrix-scene` owns the canonical project, hierarchy, components, relations, patches, revisions, and session undo. `norrix-storage` persists opaque complete state payloads and immutable blobs.
+
+`norrix-pipeline` owns page-stage scheduling, model lifetime, progress, cancellation, and incremental commits. `norrix-ml` owns models and the shared device abstraction; `norrix-translator` owns local and hosted translation connections.
+
+## Rendering and transport
+
+`norrix-renderer` interprets a page as a portable prepared frame owned by `norrix-rasterizer`. Browser transport splits its manifest from content-hashed resources. Raster data is tiled with sampling gutters, bounding browser copies, validation, uploads, and eviction.
+
+`norrix-canvas` retains resources across pages and activates a staged frame through WebGPU only when every dependency is ready. Native PNG, PSD, font previews, and Agent previews compose the same full-resolution resources through native readback.
+
+`norrix-desktop` coordinates latest-wins preparation and exact-generation manifests and resources. The webview owns the visible window surface.
+
+## Native runtime boundary
+
+Safe wrappers `norrix-torch`, `norrix-llama`, and `norrix-diffusion` are separate from unsafe `-sys` dynamic-loading crates. `norrix-runtime` discovers, downloads, validates, and loads their packages.
+
+Three crates are shared across the diagram and omitted from it: `norrix-config` owns the typed sections of `config.toml`, `norrix-secrets` wraps the operating system credential store, and `norrix-metrics` collects telemetry.
+
+<CardGroup cols={2}>
+  <Card title="Scene and storage" icon="database" href="/en/development/scene">
+    Trace edits, revisions, publication, and recovery.
+  </Card>
+
+  <Card title="Processing and rendering" icon="layer-group" href="/en/development/rendering">
+    Follow stage commits through browser presentation.
+  </Card>
+</CardGroup>
