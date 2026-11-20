@@ -14,6 +14,8 @@ use serde::Serialize;
 use specta::Type;
 use tauri::ipc::{Channel, IpcResponse};
 
+use norrix_desktop::CanvasState;
+
 #[derive(Debug, Type)]
 #[specta(transparent)]
 pub(crate) struct Error(#[specta(type = String)] anyhow::Error);
@@ -52,6 +54,63 @@ impl<T: IpcResponse> ChannelExt<T> for Mutex<Option<Channel<T>>> {
     }
 }
 
+pub(crate) fn publish_canvas(
+    channel: &Mutex<Option<Channel<CanvasState>>>,
+    state: CanvasState,
+    job_id: Option<&str>,
+    processed_page: Option<norrix_scene::EntityId>,
+) {
+    let trace_id = state.trace_id.clone();
+    let page = state.page;
+    let revision = state.revision;
+    let generation = state.generation;
+    let mut registered_channel = channel.lock();
+    let Some(sender) = registered_channel.as_ref() else {
+        tracing::warn!(
+            event = "canvas_state_published",
+            trace_id,
+            job_id = job_id.unwrap_or("unavailable"),
+            processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+            page = %page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            revision = %revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+            generation,
+            subscribed = false,
+            result = "not_sent",
+            reason = "no frontend canvas channel is registered",
+        );
+        return;
+    };
+    match sender.send(state) {
+        Ok(()) => tracing::info!(
+            event = "canvas_state_published",
+            trace_id,
+            job_id = job_id.unwrap_or("unavailable"),
+            processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+            page = %page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            revision = %revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+            generation,
+            subscribed = true,
+            result = "sent",
+            confirmation = "transport_accepted_not_frontend_ack",
+        ),
+        Err(error) => {
+            tracing::error!(
+                event = "canvas_state_published",
+                trace_id,
+                job_id = job_id.unwrap_or("unavailable"),
+                processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+                page = %page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                revision = %revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+                generation,
+                subscribed = true,
+                result = "send_failed",
+                error = %error,
+            );
+            registered_channel.take();
+        }
+    }
+}
+
 pub fn bindings() -> tauri_specta::Builder<tauri_runtime_cef::CefRuntime> {
     use tauri_specta::{Builder, ErrorHandlingMode, collect_commands};
 
@@ -84,6 +143,7 @@ pub fn bindings() -> tauri_specta::Builder<tauri_runtime_cef::CefRuntime> {
             editing::set_typography,
             editing::set_geometry,
             editing::set_visibility,
+            editing::set_progress_markers,
             editing::delete_layers,
             editing::move_layer,
             editing::undo,
@@ -98,9 +158,10 @@ pub fn bindings() -> tauri_specta::Builder<tauri_runtime_cef::CefRuntime> {
             preferences::get_preferences,
             preferences::get_translation_models,
             preferences::get_gemini_api_keys,
-            preferences::set_gemini_primary_key,
-            preferences::add_gemini_secondary_key,
-            preferences::remove_gemini_secondary_key,
+            preferences::set_gemini_api_key_manual_status,
+            preferences::add_gemini_api_key,
+            preferences::replace_gemini_api_key,
+            preferences::remove_gemini_api_key,
             preferences::clear_gemini_api_keys,
             preferences::test_gemini_api_key,
             canvas::get_canvas_manifest,

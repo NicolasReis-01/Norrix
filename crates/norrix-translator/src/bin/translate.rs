@@ -136,7 +136,7 @@ fn prepare_secret(args: &Args, provider: Provider) -> Result<()> {
             return Ok(());
         }
         if let Some(value) = env::var(variable).ok().filter(|key| !key.trim().is_empty()) {
-            norrix_translator::set_gemini_primary_api_key(SecretString::from(value))?;
+            norrix_translator::add_gemini_api_key(SecretString::from(value))?;
             return Ok(());
         }
         if required && !norrix_translator::gemini_api_keys_configured()? {

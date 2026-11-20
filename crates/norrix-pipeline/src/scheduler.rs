@@ -140,6 +140,31 @@ impl Scheduler {
         }
         page_finished
     }
+
+    pub(crate) fn fail_page(&mut self, page: EntityId, failed_stage: Stage) -> usize {
+        let Some(&page_index) = self.page_index.get(&page) else {
+            return 0;
+        };
+        let page_work = &mut self.pages[page_index];
+        let was_finished = page_work.finished();
+        let mut completed = 0;
+        for work in &mut page_work.stages {
+            if work.state == WorkState::Pending
+                || (work.stage == failed_stage && work.state == WorkState::Running)
+            {
+                work.state = WorkState::Finished;
+                completed += 1;
+            }
+        }
+        let page_finished = !was_finished && page_work.finished();
+        if page_finished {
+            self.active_pages = self.active_pages.saturating_sub(1);
+            while self.head < self.pages.len() && self.pages[self.head].finished() {
+                self.head += 1;
+            }
+        }
+        completed
+    }
 }
 
 const fn prerequisite(stage: Stage) -> Option<Stage> {

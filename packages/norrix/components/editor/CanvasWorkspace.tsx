@@ -1,6 +1,7 @@
 'use client'
 
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { LoaderCircle } from 'lucide-react'
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { useColorSampling } from '@/components/controls/ColorSampling'
@@ -26,9 +27,11 @@ import {
   canvasPageLayouts,
   ghostPageOffsets,
   infiniteScrollTranslation,
+  infiniteScrollTopForZoom,
   pageIndexAtScroll,
   pageSequenceHeight,
   residentPageIds,
+  visiblePageIds,
 } from '@/lib/page-layout'
 import {
   pageKey,
@@ -54,6 +57,7 @@ import {
 import {
   prefetchCanvasPages,
   previewCanvasOpacity,
+  traceCanvas,
   workspaceColor,
   type Canvas,
   type CanvasColor,
@@ -127,6 +131,19 @@ interface CanvasView {
   translation: [number, number]
 }
 
+interface InfiniteZoomAnchor {
+  previousZoom: number
+  nextZoom: number
+  scrollTop: number
+  viewportHeight: number
+}
+
+interface PendingCanvasCommit {
+  page: string
+  revision: number
+  generation: number
+}
+
 interface StrokeUpdate {
   kind: 'paint' | 'erase' | 'inpaint'
   points: Point[]
@@ -172,6 +189,7 @@ export function CanvasWorkspace() {
   const transformPage = useRef<string | null>(null)
   const transformFinal = useRef<TransformFrame[]>([])
   const commitPending = useRef(false)
+  const pendingCanvasCommit = useRef<PendingCanvasCommit | null>(null)
   const pendingTextEdit = useRef<PendingTextEdit | null>(null)
   const attemptPendingTextEditRef = useRef<() => void>(() => {})
   const directTextClick = useRef<DirectTextClickCandidate | null>(null)
@@ -180,6 +198,8 @@ export function CanvasWorkspace() {
   const commandQueue = useRef<Promise<void>>(Promise.resolve())
   const [previews, setPreviews] = useState<Record<string, Frame>>({})
   const [textEdit, setTextEdit] = useState<ActiveTextEdit | null>(null)
+  const textEditSessionId = useRef<string | null>(null)
+  const nextTextEditSessionId = useRef(0)
   const textEditDirty = useRef(false)
   const textEditWriteFailed = useRef(false)
   const textEditFinishPending = useRef(false)
@@ -188,6 +208,22 @@ export function CanvasWorkspace() {
   const [hovered, setHovered] = useState<string | null>(null)
   const [cursor, setCursor] = useState<Point | null>(null)
   const [scrollTop, setScrollTop] = useState(0)
+  const lastObservedScrollTop = useRef<number | null>(null)
+  const lastInternalScrollWrite = useRef<{
+    operation: string
+    requestedScrollTop: number
+    timestamp: string
+  } | null>(null)
+  const [canvasLayoutError, setCanvasLayoutError] = useState<Error | null>(null)
+  const [canvasLayoutRetry, setCanvasLayoutRetry] = useState(0)
+  const infiniteZoomAnchor = useRef<InfiniteZoomAnchor | null>(null)
+  const pageLayoutsRef = useRef<ReturnType<typeof canvasPageLayouts>>([])
+  const lastAppliedLayout = useRef<{
+    canvas: Canvas
+    signature: string
+    pages: string[]
+  } | null>(null)
+  const pageLayoutRequest = useRef(0)
   const [gesturePage, setGesturePage] = useState<string | null>(null)
   const [viewportSize, setViewportSize] = useState<[number, number]>([0, 0])
   const colorSampling = useColorSampling()
@@ -208,6 +244,7 @@ export function CanvasWorkspace() {
   const selectedLayersByPage = useNorrixStore((state) => state.selectedLayersByPage)
   const selectPage = useNorrixStore((state) => state.selectPage)
   const canvasPage = useNorrixStore((state) => state.canvasPage)
+  const canvasTraceId = useNorrixStore((state) => state.canvasTraceId)
   const canvasRevision = useNorrixStore((state) => state.canvasRevision)
   const canvasGeneration = useNorrixStore((state) => state.canvasGeneration)
   const canvasSize = useNorrixStore((state) => state.canvasSize)
@@ -222,8 +259,84 @@ export function CanvasWorkspace() {
   const setTool = useNorrixStore((state) => state.setTool)
   const setBrush = useNorrixStore((state) => state.setBrush)
   const requestCanvasFit = useNorrixStore((state) => state.requestCanvasFit)
-  const canvasState = useCanvas(canvasElement, canvasRevision, canvasGeneration)
+  const rendererPageId =
+    workspaceMode === 'infinite' ? (canvasPage ?? page?.id ?? null) : (page?.id ?? null)
+  const canvasState = useCanvas(
+    canvasElement,
+    canvasRevision,
+    canvasGeneration,
+    rendererPageId,
+    canvasTraceId,
+  )
+  const canvasStateRef = useRef(canvasState)
+  canvasStateRef.current = canvasState
   const canvas = canvasState.canvas
+  useEffect(() => {
+    const viewport = surface.current
+    const current = useNorrixStore.getState()
+    traceCanvas('canvas-workspace-mounted', {
+      operation: 'CanvasWorkspace.lifecycle',
+      page: current.selectedPage,
+      presentedPage: current.canvasPage,
+      traceId: current.canvasTraceId,
+      revision: current.canvasRevision,
+      generation: current.canvasGeneration,
+      canvasScrollTop: viewport?.scrollTop ?? null,
+      pageRailScrollTop: pageRailScrollTop(),
+      result: 'mounted',
+    })
+    return () => {
+      const latest = useNorrixStore.getState()
+      traceCanvas('canvas-workspace-unmounted', {
+        operation: 'CanvasWorkspace.lifecycle',
+        page: latest.selectedPage,
+        presentedPage: latest.canvasPage,
+        traceId: latest.canvasTraceId,
+        revision: latest.canvasRevision,
+        generation: latest.canvasGeneration,
+        canvasScrollTop: viewport?.scrollTop ?? null,
+        pageRailScrollTop: pageRailScrollTop(),
+        result: 'unmounted',
+        reason: 'React component cleanup',
+      })
+    }
+  }, [])
+  const completePendingCanvasCommit = useCallback(() => {
+    const pending = pendingCanvasCommit.current
+    if (!pending) return
+    const currentCanvas = canvasStateRef.current
+    const currentStore = useNorrixStore.getState()
+    if (currentCanvas.status === 'error') {
+      pendingCanvasCommit.current = null
+      commitPending.current = false
+      attemptPendingTextEditRef.current()
+      return
+    }
+    if (
+      currentCanvas.status !== 'ready' ||
+      currentStore.canvasGeneration <= pending.generation ||
+      currentCanvas.generation !== currentStore.canvasGeneration
+    )
+      return
+    if (
+      currentStore.canvasPage === pending.page &&
+      (currentStore.canvasRevision === null || currentStore.canvasRevision < pending.revision)
+    )
+      return
+    pendingCanvasCommit.current = null
+    commitPending.current = false
+    attemptPendingTextEditRef.current()
+  }, [])
+  useEffect(() => {
+    completePendingCanvasCommit()
+  }, [
+    completePendingCanvasCommit,
+    canvasGeneration,
+    canvasPage,
+    canvasRevision,
+    canvasState.generation,
+    canvasState.status,
+  ])
   const summaries = useMemo(() => pages ?? [], [pages])
   const residentIds = useMemo(() => {
     if (workspaceMode !== 'infinite') return []
@@ -339,6 +452,7 @@ export function CanvasWorkspace() {
       workspaceMode,
     ],
   )
+  pageLayoutsRef.current = pageLayouts
   const pageSequenceSize =
     workspaceMode === 'infinite'
       ? pageSequenceHeight(summaries, camera.zoom, window.devicePixelRatio)
@@ -438,21 +552,28 @@ export function CanvasWorkspace() {
       return
     }
     commitPending.current = true
+    const generation = useNorrixStore.getState().canvasGeneration
     void enqueue(() => call(commands.commitTransform, targetPage, revision, elements))
       .then((nextRevision) => {
-        return nextRevision === null ? undefined : refresh(projectKey, pagesKey, pageKey)
+        if (nextRevision === null) return
+        pendingCanvasCommit.current = { page: targetPage, revision: nextRevision, generation }
+        completePendingCanvasCommit()
+        return refresh(projectKey, pagesKey, pageKey)
       })
       .catch((error: unknown) => {
+        pendingCanvasCommit.current = null
         cancelCanvasTransform()
         receiveError(errorMessage(error))
       })
       .finally(() => {
-        commitPending.current = false
         setPreviews({})
         setGesturePage(null)
-        attemptPendingTextEditRef.current()
+        if (!pendingCanvasCommit.current) {
+          commitPending.current = false
+          attemptPendingTextEditRef.current()
+        }
       })
-  }, [cancelCanvasTransform, canvas, enqueue, transformUpdates])
+  }, [cancelCanvasTransform, canvas, completePendingCanvasCommit, enqueue, transformUpdates])
 
   const cancelGesture = useCallback(
     (preserveRecognizedTextClick = false) => {
@@ -549,6 +670,8 @@ export function CanvasWorkspace() {
         : layerFontSizes[layer.id]
       try {
         previewCanvasOpacity(layer.id, 0)
+        nextTextEditSessionId.current += 1
+        textEditSessionId.current = `text-edit-${nextTextEditSessionId.current}`
         textEditDirty.current = false
         textEditWriteFailed.current = false
         textEditFinishPending.current = false
@@ -654,10 +777,11 @@ export function CanvasWorkspace() {
           : current,
       )
       textEditDirty.current = true
+      const editSession = textEditSessionId.current
       void enqueue(() =>
         session.field === 'translation'
-          ? call(commands.setTranslation, session.layer.id, text, null)
-          : call(commands.setSourceText, session.layer.id, text, null),
+          ? call(commands.setTranslation, session.layer.id, text, editSession)
+          : call(commands.setSourceText, session.layer.id, text, editSession),
       )
         .then(() => {
           textEditWriteFailed.current = false
@@ -674,29 +798,38 @@ export function CanvasWorkspace() {
     const current = textEdit
     if (!current || textEditFinishPending.current) return
     if (!textEditDirty.current) {
+      textEditSessionId.current = null
       setTextEdit(null)
       return
     }
 
     textEditFinishPending.current = true
-    void commandQueue.current
-      .then(async () => {
-        if (textEditWriteFailed.current) return
-        try {
-          await refresh(projectKey, pagesKey, pageKey)
-        } catch (error) {
-          receiveError(errorMessage(error))
+    void enqueue(async () => {
+      if (textEditWriteFailed.current) return
+      if (workspaceMode === 'single' && useNorrixStore.getState().selectedPage === current.page) {
+        if (current.field === 'translation') {
+          await call(commands.setTranslation, current.layer.id, current.value, null)
+        } else {
+          await call(commands.setSourceText, current.layer.id, current.value, null)
         }
-        if (textEditWriteFailed.current) return
-        textEditDirty.current = false
-        setTextEdit((active) =>
-          active?.layer.id === current.layer.id && active.page === current.page ? null : active,
-        )
+      }
+      if (textEditWriteFailed.current) return
+      await refresh(projectKey, pagesKey, pageKey)
+      if (textEditWriteFailed.current) return
+      textEditDirty.current = false
+      textEditSessionId.current = null
+      setTextEdit((active) =>
+        active?.layer.id === current.layer.id && active.page === current.page ? null : active,
+      )
+    })
+      .catch((error: unknown) => {
+        textEditWriteFailed.current = true
+        receiveError(errorMessage(error))
       })
       .finally(() => {
         textEditFinishPending.current = false
       })
-  }, [textEdit])
+  }, [enqueue, textEdit, workspaceMode])
 
   useEffect(() => {
     if (textEdit && selectedPage && selectedPage !== textEdit.page) finishTextEditing()
@@ -723,6 +856,21 @@ export function CanvasWorkspace() {
   }, [])
 
   const textEditLayer = textEdit?.layer.id
+  useEffect(() => {
+    if (!textEdit) return
+    const textPage =
+      workspaceMode === 'infinite'
+        ? preparedPages[textEdit.page]?.page
+        : page?.id === textEdit.page
+          ? page
+          : undefined
+    if (textPage && !textPage.layers.some((layer) => layer.id === textEdit.layer.id)) {
+      setTextEdit((current) =>
+        current?.page === textEdit.page && current.layer.id === textEdit.layer.id ? null : current,
+      )
+    }
+  }, [page, preparedPages, textEdit, workspaceMode])
+
   useEffect(() => {
     if (!textEditLayer) return
     return () => {
@@ -758,6 +906,16 @@ export function CanvasWorkspace() {
             translation: infiniteScrollTranslation(element.scrollTop, dpr),
           }
         : containCamera(viewportWidth * dpr, viewportHeight * dpr, pageWidth, pageHeight!)
+    if (workspaceMode === 'infinite' && next.zoom !== useNorrixStore.getState().camera.zoom) {
+      const currentZoom = useNorrixStore.getState().camera.zoom
+      const pending = infiniteZoomAnchor.current
+      infiniteZoomAnchor.current = {
+        previousZoom: pending?.previousZoom ?? currentZoom,
+        nextZoom: next.zoom,
+        scrollTop: pending?.scrollTop ?? element.scrollTop,
+        viewportHeight: pending?.viewportHeight ?? viewportHeight,
+      }
+    }
     useNorrixStore.setState({ camera: { ...next, fitted: true } })
   }, [pageHeight, pageId, pageWidth, summaries, workspaceMode])
 
@@ -781,11 +939,22 @@ export function CanvasWorkspace() {
     const dpr = window.devicePixelRatio
     const current = useNorrixStore.getState().camera
     if (useNorrixStore.getState().workspaceMode === 'infinite') {
-      const scroll = element.scrollTop
+      if (zoom === current.zoom) return
+      const pending = infiniteZoomAnchor.current
+      if (pending && zoom === pending.previousZoom) {
+        infiniteZoomAnchor.current = null
+      } else {
+        infiniteZoomAnchor.current = {
+          previousZoom: pending?.previousZoom ?? current.zoom,
+          nextZoom: zoom,
+          scrollTop: pending?.scrollTop ?? element.scrollTop,
+          viewportHeight: pending?.viewportHeight ?? (element.clientHeight || bounds.height),
+        }
+      }
       useNorrixStore.setState({
         camera: {
           zoom,
-          translation: infiniteScrollTranslation(scroll, dpr),
+          translation: infiniteScrollTranslation(element.scrollTop, dpr),
           fitted: false,
         },
       })
@@ -802,6 +971,48 @@ export function CanvasWorkspace() {
       },
     })
   }, [])
+
+  useLayoutEffect(() => {
+    const element = surface.current
+    const anchor = infiniteZoomAnchor.current
+    if (workspaceMode !== 'infinite') {
+      infiniteZoomAnchor.current = null
+      return
+    }
+    if (!element || !anchor || anchor.nextZoom !== camera.zoom) return
+    infiniteZoomAnchor.current = null
+    const top = infiniteScrollTopForZoom(
+      anchor.scrollTop,
+      anchor.viewportHeight,
+      anchor.previousZoom,
+      anchor.nextZoom,
+      window.devicePixelRatio,
+    )
+    const currentStore = useNorrixStore.getState()
+    traceCanvas('infinite-scroll-position-write', {
+      operation: 'zoom-anchor',
+      page: currentStore.selectedPage,
+      revision: currentStore.canvasRevision,
+      generation: currentStore.canvasGeneration,
+      previousScrollTop: element.scrollTop,
+      requestedScrollTop: top,
+      result: 'written',
+    })
+    lastInternalScrollWrite.current = {
+      operation: 'zoom-anchor',
+      requestedScrollTop: top,
+      timestamp: new Date().toISOString(),
+    }
+    element.scrollTop = top
+    setScrollTop(element.scrollTop)
+    const current = useNorrixStore.getState().camera
+    useNorrixStore.setState({
+      camera: {
+        ...current,
+        translation: infiniteScrollTranslation(element.scrollTop, window.devicePixelRatio),
+      },
+    })
+  }, [camera.zoom, workspaceMode])
 
   useEffect(() => {
     const element = surface.current
@@ -835,6 +1046,20 @@ export function CanvasWorkspace() {
           ? surface.current.scrollTop
           : summaries.slice(0, index).reduce((height, summary) => height + summary.size.height, 0) *
             scale
+      traceCanvas('infinite-scroll-position-write', {
+        operation: 'workspace-mode-transition',
+        page: target,
+        revision: useNorrixStore.getState().canvasRevision,
+        generation: useNorrixStore.getState().canvasGeneration,
+        previousScrollTop: surface.current.scrollTop,
+        requestedScrollTop: top,
+        result: 'written',
+      })
+      lastInternalScrollWrite.current = {
+        operation: 'workspace-mode-transition',
+        requestedScrollTop: top,
+        timestamp: new Date().toISOString(),
+      }
       surface.current.scrollTop = top
       setScrollTop(top)
       useNorrixStore.setState({
@@ -877,9 +1102,26 @@ export function CanvasWorkspace() {
     const index = summaries.findIndex((summary) => summary.id === pageNavigation.page)
     if (index < 0) return
     handledPageNavigation.current = pageNavigation.request
+    const zoom = useNorrixStore.getState().camera.zoom
     const top =
       summaries.slice(0, index).reduce((height, summary) => height + summary.size.height, 0) *
-      (camera.zoom / window.devicePixelRatio)
+      (zoom / window.devicePixelRatio)
+    const currentStore = useNorrixStore.getState()
+    traceCanvas('infinite-scroll-position-write', {
+      operation: 'page-navigation',
+      page: pageNavigation.page,
+      revision: currentStore.canvasRevision,
+      generation: currentStore.canvasGeneration,
+      previousScrollTop: surface.current.scrollTop,
+      requestedScrollTop: top,
+      request: pageNavigation.request,
+      result: 'written',
+    })
+    lastInternalScrollWrite.current = {
+      operation: 'page-navigation',
+      requestedScrollTop: top,
+      timestamp: new Date().toISOString(),
+    }
     surface.current.scrollTop = top
     setScrollTop(top)
     const currentCamera = useNorrixStore.getState().camera
@@ -889,7 +1131,7 @@ export function CanvasWorkspace() {
         translation: infiniteScrollTranslation(surface.current.scrollTop, window.devicePixelRatio),
       },
     })
-  }, [camera.zoom, pageNavigation, summaries, workspaceMode])
+  }, [pageNavigation, summaries, workspaceMode])
 
   useEffect(() => {
     canvas?.setView(camera.zoom, camera.translation)
@@ -911,9 +1153,40 @@ export function CanvasWorkspace() {
           ...Object.values(adjacentPagesFor(summaries, residentIds)).flat(),
         ]),
       ]
-      void prefetchCanvasPages(pagesToPrepare)
+      traceCanvas('infinite-page-prefetch-requested', {
+        operation: 'CanvasWorkspace.prefetch',
+        traceId: canvasTraceId,
+        activePage: selectedPage,
+        presentedPage: canvasPage,
+        revision: canvasRevision,
+        generation: canvasGeneration,
+        pages: pagesToPrepare,
+        result: 'started',
+      })
+      void prefetchCanvasPages(pagesToPrepare, {
+        operation: 'infinite-viewport-prefetch',
+        traceId: canvasTraceId,
+        generation: canvasGeneration,
+        revision: canvasRevision,
+      })
         .then((prepared) => {
           for (const item of prepared) {
+            const previous = queryClient.getQueryData<CanvasPagePreparation>(
+              preparedPageKey(item.page.id),
+            )
+            traceCanvas('infinite-page-preparation-cache-updated', {
+              operation: 'infinite-viewport-prefetch',
+              traceId: canvasTraceId,
+              page: item.page.id,
+              knownRevision: previous?.revision ?? null,
+              preparedRevision: item.revision,
+              activePage: selectedPage,
+              presentedPage: canvasPage,
+              result:
+                previous?.revision === item.revision
+                  ? 'same-revision-prepared'
+                  : 'prepared-revision-updated',
+            })
             queryClient.setQueryData(preparedPageKey(item.page.id), item)
           }
         })
@@ -926,9 +1199,40 @@ export function CanvasWorkspace() {
       (id): id is string => id !== undefined,
     )
     if (adjacent.length) {
-      void prefetchCanvasPages(adjacent)
+      traceCanvas('adjacent-page-prefetch-requested', {
+        operation: 'CanvasWorkspace.prefetch',
+        traceId: canvasTraceId,
+        activePage: selectedPage,
+        presentedPage: canvasPage,
+        revision: canvasRevision,
+        generation: canvasGeneration,
+        pages: adjacent,
+        result: 'started',
+      })
+      void prefetchCanvasPages(adjacent, {
+        operation: 'single-page-adjacent-prefetch',
+        traceId: canvasTraceId,
+        generation: canvasGeneration,
+        revision: canvasRevision,
+      })
         .then((prepared) => {
           for (const page of prepared) {
+            const previous = queryClient.getQueryData<CanvasPagePreparation>(
+              preparedPageKey(page.page.id),
+            )
+            traceCanvas('adjacent-page-preparation-cache-updated', {
+              operation: 'single-page-adjacent-prefetch',
+              traceId: canvasTraceId,
+              page: page.page.id,
+              knownRevision: previous?.revision ?? null,
+              preparedRevision: page.revision,
+              activePage: selectedPage,
+              presentedPage: canvasPage,
+              result:
+                previous?.revision === page.revision
+                  ? 'same-revision-prepared'
+                  : 'prepared-revision-updated',
+            })
             queryClient.setQueryData(preparedPageKey(page.page.id), page)
           }
         })
@@ -936,24 +1240,537 @@ export function CanvasWorkspace() {
     }
   }, [
     canvasGeneration,
+    canvasTraceId,
     canvasPage,
+    canvasRevision,
     canvasState.generation,
     canvasState.status,
     pageId,
     pages,
     residentIds,
+    selectedPage,
     summaries,
     workspaceMode,
   ])
 
   useEffect(() => {
     if (!canvas || canvasState.status !== 'ready') return
-    try {
-      canvas.setPageLayout(pageLayouts)
-    } catch (error) {
-      receiveError(errorMessage(error))
+    const request = ++pageLayoutRequest.current
+    setCanvasLayoutError(null)
+    const applyLayout = (layouts = pageLayoutsRef.current) => {
+      const canvasScrollTopBefore = surface.current?.scrollTop ?? null
+      const railScrollTopBefore = pageRailScrollTop()
+      if (pageLayoutRequest.current !== request) {
+        traceCanvas('layout-application-cancelled', {
+          operation: 'Canvas.setPageLayout',
+          page: selectedPage,
+          presentedPage: canvasPage,
+          generation: canvasGeneration,
+          revision: canvasRevision,
+          pages: layouts.map(({ page, revision }) => ({ page, revision })),
+          pageIndexes: layouts.map(({ page }) =>
+            summaries.findIndex((summary) => summary.id === page),
+          ),
+          canvasScrollTopBefore,
+          canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+          pageRailScrollTopBefore: railScrollTopBefore,
+          pageRailScrollTopAfter: pageRailScrollTop(),
+          result: 'cancelled',
+          reason: 'layout request was superseded',
+        })
+        return false
+      }
+      const details = {
+        operation: 'Canvas.setPageLayout',
+        page: selectedPage,
+        presentedPage: canvasPage,
+        activePageIndex: summaries.findIndex((summary) => summary.id === selectedPage),
+        generation: canvasGeneration,
+        revision: canvasRevision,
+        pages: layouts.map(({ page, revision, ghostPages }) => ({
+          page,
+          revision,
+          index: summaries.findIndex((summary) => summary.id === page),
+          ghosts: ghostPages.map(({ page: ghost }) => ({
+            page: ghost,
+            index: summaries.findIndex((summary) => summary.id === ghost),
+          })),
+        })),
+        previousCompositionPages:
+          lastAppliedLayout.current?.canvas === canvas ? lastAppliedLayout.current.pages : [],
+        canvasScrollTopBefore,
+        pageRailScrollTopBefore: railScrollTopBefore,
+      }
+      const signature = JSON.stringify(layouts)
+      traceCanvas('layout-application-started', { ...details, result: 'started' })
+      try {
+        const accepted = canvas.setPageLayout(layouts)
+        if (accepted) {
+          lastAppliedLayout.current = {
+            canvas,
+            signature,
+            pages: layouts.map(({ page }) => page),
+          }
+        }
+        traceCanvas(accepted ? 'layout-applied' : 'layout-rejected', {
+          ...details,
+          signature,
+          returnValue: accepted,
+          canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+          pageRailScrollTopAfter: pageRailScrollTop(),
+          result: accepted ? 'accepted' : 'rejected',
+          reason: accepted
+            ? null
+            : (canvas.getLastLayoutRejection() ??
+              'WASM returned false without a layout validation reason; current composition was retained'),
+        })
+        return accepted
+      } catch (reason) {
+        traceCanvas('layout-application-failed', {
+          ...details,
+          canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+          pageRailScrollTopAfter: pageRailScrollTop(),
+          result: 'failed',
+          reason: errorMessage(reason),
+        })
+        throw reason
+      }
     }
-  }, [canvas, canvasState.status, pageLayouts])
+
+    if (pageLayouts.length === 0) {
+      if (!canvasState.hasFrame) lastAppliedLayout.current = null
+      traceCanvas('layout-application-deferred', {
+        operation: 'Canvas.setPageLayout',
+        page: selectedPage,
+        presentedPage: canvasPage,
+        generation: canvasGeneration,
+        revision: canvasRevision,
+        pages: [],
+        canvasScrollTop: surface.current?.scrollTop ?? null,
+        pageRailScrollTop: pageRailScrollTop(),
+        result: 'deferred',
+        reason: 'no prepared page layout; retain the current composition',
+      })
+      return
+    }
+    if (workspaceMode === 'infinite') {
+      const visiblePages = visiblePageIds(
+        summaries,
+        scrollTop,
+        viewportSize[1],
+        camera.zoom,
+        window.devicePixelRatio,
+      )
+      const layoutPages = new Set(pageLayouts.map(({ page }) => page))
+      const missingVisiblePages = visiblePages.filter(
+        (visiblePage) => !layoutPages.has(visiblePage),
+      )
+      if (missingVisiblePages.length > 0) {
+        traceCanvas('layout-application-deferred', {
+          operation: 'Canvas.setPageLayout',
+          page: selectedPage,
+          presentedPage: canvasPage,
+          generation: canvasGeneration,
+          revision: canvasRevision,
+          pages: pageLayouts.map(({ page, revision }) => ({ page, revision })),
+          pageIndexes: pageLayouts.map(({ page }) =>
+            summaries.findIndex((summary) => summary.id === page),
+          ),
+          visiblePages,
+          missingVisiblePages,
+          canvasScrollTop: surface.current?.scrollTop ?? null,
+          pageRailScrollTop: pageRailScrollTop(),
+          result: 'deferred',
+          reason: 'one or more pages intersecting the viewport are not prepared',
+        })
+        return
+      }
+    }
+    const layoutSignature = JSON.stringify(pageLayouts)
+    if (
+      lastAppliedLayout.current?.canvas === canvas &&
+      lastAppliedLayout.current.signature === layoutSignature
+    ) {
+      traceCanvas('layout-application-skipped', {
+        operation: 'Canvas.setPageLayout',
+        page: selectedPage,
+        presentedPage: canvasPage,
+        generation: canvasGeneration,
+        revision: canvasRevision,
+        pages: pageLayouts.map(({ page, revision }) => ({ page, revision })),
+        canvasScrollTop: surface.current?.scrollTop ?? null,
+        pageRailScrollTop: pageRailScrollTop(),
+        result: 'unchanged',
+        reason: 'composition layout is already active',
+      })
+      return
+    }
+
+    try {
+      if (applyLayout()) {
+        setCanvasLayoutError(null)
+        return
+      }
+    } catch (error) {
+      if (pageLayoutRequest.current === request) {
+        setCanvasLayoutError(new Error(errorMessage(error)))
+      }
+      return
+    }
+
+    const pagesToPrepare = [
+      ...new Set(
+        pageLayouts.flatMap((layout) => [
+          layout.page,
+          ...layout.ghostPages.map((ghost) => ghost.page),
+        ]),
+      ),
+    ]
+    if (!pagesToPrepare.length) {
+      setCanvasLayoutError(null)
+      return
+    }
+    const recoveryScrollBefore = {
+      canvas: surface.current?.scrollTop ?? null,
+      pageRail: pageRailScrollTop(),
+    }
+    const recoveryLayouts = pageLayouts
+    const recoveryLayoutSignature = JSON.stringify(recoveryLayouts)
+    const pinnedPages = [...new Set(pagesToPrepare)]
+    if (process.env.NODE_ENV === 'development') {
+      traceCanvas('layout-waiting-for-frames', {
+        operation: 'prefetchCanvasPages',
+        pages: pagesToPrepare,
+        generation: canvasGeneration,
+        revision: canvasRevision,
+        requestedPage: selectedPage,
+        presentedPage: canvasPage,
+        canvasScrollTop: recoveryScrollBefore.canvas,
+        pageRailScrollTop: recoveryScrollBefore.pageRail,
+        layouts: pageLayouts.map(({ page, revision, ghostPages }) => ({
+          page,
+          index: summaries.findIndex((summary) => summary.id === page),
+          revision,
+          ghosts: ghostPages.map(({ page: ghost }) => ({
+            page: ghost,
+            index: summaries.findIndex((summary) => summary.id === ghost),
+          })),
+        })),
+        result: 'waiting',
+      })
+    }
+    canvas.pinPageManifests(pinnedPages)
+    void prefetchCanvasPages(pagesToPrepare, {
+      operation: 'layout-recovery',
+      generation: canvasGeneration,
+      revision: canvasRevision,
+    })
+      .then((prepared) => {
+        if (pageLayoutRequest.current !== request) {
+          traceCanvas('layout-recovery-discarded', {
+            operation: 'prefetchCanvasPages',
+            page: selectedPage,
+            presentedPage: canvasPage,
+            generation: canvasGeneration,
+            revision: canvasRevision,
+            requestedPageIndex: summaries.findIndex((summary) => summary.id === selectedPage),
+            presentedPageIndex: summaries.findIndex((summary) => summary.id === canvasPage),
+            requestedPages: pagesToPrepare.map((page) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+            })),
+            preparedFrames: prepared.map(({ page, revision }) => ({
+              page: page.id,
+              index: summaries.findIndex((summary) => summary.id === page.id),
+              revision,
+            })),
+            missingFrames: pagesToPrepare
+              .filter((page) => !prepared.some((item) => item.page.id === page))
+              .map((page) => ({
+                page,
+                index: summaries.findIndex((summary) => summary.id === page),
+              })),
+            canvasScrollTopBefore: recoveryScrollBefore.canvas,
+            canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+            pageRailScrollTopBefore: recoveryScrollBefore.pageRail,
+            pageRailScrollTopAfter: pageRailScrollTop(),
+            discardedFrames: prepared
+              .filter((item) => !pagesToPrepare.includes(item.page.id))
+              .map(({ page, revision }) => ({
+                page: page.id,
+                index: summaries.findIndex((summary) => summary.id === page.id),
+                revision,
+              })),
+            result: 'discarded',
+            reason: 'layout request was superseded before recovery completed',
+          })
+          return
+        }
+        const preparedByPage = new Map(prepared.map((item) => [item.page.id, item]))
+        const missingPreparations = pagesToPrepare.filter((page) => !preparedByPage.has(page))
+        const unexpectedPreparations = prepared
+          .filter((item) => !pagesToPrepare.includes(item.page.id))
+          .map(({ page, revision }) => ({ page: page.id, revision }))
+        traceCanvas('layout-recovery-frames-ready', {
+          operation: 'prefetchCanvasPages',
+          requestedPage: selectedPage,
+          presentedPage: canvasPage,
+          generation: canvasGeneration,
+          revision: canvasRevision,
+          requestedPages: pagesToPrepare.map((page) => ({
+            page,
+            index: summaries.findIndex((summary) => summary.id === page),
+          })),
+          preparedFrames: prepared.map(({ page, revision }) => ({
+            page: page.id,
+            index: summaries.findIndex((summary) => summary.id === page.id),
+            revision,
+          })),
+          missingFrames: missingPreparations.map((page) => ({
+            page,
+            index: summaries.findIndex((summary) => summary.id === page),
+          })),
+          discardedFrames: unexpectedPreparations,
+          canvasScrollTopBefore: recoveryScrollBefore.canvas,
+          canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+          pageRailScrollTopBefore: recoveryScrollBefore.pageRail,
+          pageRailScrollTopAfter: pageRailScrollTop(),
+          result: missingPreparations.length === 0 ? 'complete' : 'partial',
+          reason:
+            missingPreparations.length === 0
+              ? null
+              : 'one or more requested frames were not returned by prefetch',
+        })
+        for (const item of prepared) {
+          queryClient.setQueryData(preparedPageKey(item.page.id), item)
+        }
+        if (missingPreparations.length > 0) {
+          const error = new Error(
+            `Canvas frame recovery returned ${prepared.length} of ${pagesToPrepare.length} required pages.`,
+          )
+          setCanvasLayoutError(error)
+          console.error('[Norrix canvas]', 'layout-restore-failed', {
+            timestamp: new Date().toISOString(),
+            monotonicMs: performance.now(),
+            ...serializeCanvasError(error),
+            operation: 'prefetchCanvasPages for layout recovery',
+            result: 'incomplete-prefetch',
+            returnValue: {
+              kind: 'prepared-frame-list',
+              count: prepared.length,
+              frames: prepared.map(({ page, revision }) => ({ page: page.id, revision })),
+            },
+            requestedPage: selectedPage,
+            presentedPage: canvasPage,
+            requestedPageIndex: summaries.findIndex((summary) => summary.id === selectedPage),
+            presentedPageIndex: summaries.findIndex((summary) => summary.id === canvasPage),
+            generation: canvasGeneration,
+            requestedRevision: canvasRevision,
+            request,
+            requestedLayouts: pageLayouts.map(({ page, revision, ghostPages }) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+              revision,
+              ghosts: ghostPages.map(({ page: ghost }) => ({
+                page: ghost,
+                index: summaries.findIndex((summary) => summary.id === ghost),
+              })),
+            })),
+            requestedFrames: pagesToPrepare,
+            preparedFrames: prepared.map(({ page, revision }) => ({
+              page: page.id,
+              index: summaries.findIndex((summary) => summary.id === page.id),
+              revision,
+            })),
+            missingFrames: missingPreparations.map((page) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+            })),
+            discardedFrames: unexpectedPreparations,
+            canvasScrollTopBefore: recoveryScrollBefore.canvas,
+            canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+            pageRailScrollTopBefore: recoveryScrollBefore.pageRail,
+            pageRailScrollTopAfter: pageRailScrollTop(),
+            reason:
+              'Recovery returned false/omitted one or more requested frames; setPageLayout was not called so the previous composition remains active.',
+          })
+          return
+        }
+        const currentLayouts = pageLayoutsRef.current
+        if (JSON.stringify(currentLayouts) !== recoveryLayoutSignature) {
+          traceCanvas('layout-recovery-discarded', {
+            operation: 'setPageLayout after complete prefetchCanvasPages',
+            page: selectedPage,
+            presentedPage: canvasPage,
+            generation: canvasGeneration,
+            revision: canvasRevision,
+            requestedLayouts: recoveryLayouts,
+            currentLayouts,
+            preparedFrames: prepared.map(({ page, revision }) => ({
+              page: page.id,
+              revision,
+            })),
+            result: 'discarded',
+            reason: 'layout changed after preparation; the prepared snapshot was not applied',
+          })
+          return
+        }
+        const recoveredLayouts = recoveryLayouts.map((layout) => {
+          const current = preparedByPage.get(layout.page)
+          return current ? { ...layout, revision: current.revision } : layout
+        })
+        if (!applyLayout(recoveredLayouts)) {
+          const error = new Error(
+            'Canvas rejected a complete recovered layout; the previously accepted composition was retained.',
+          )
+          setCanvasLayoutError(error)
+          console.error('[Norrix canvas]', 'layout-restore-failed', {
+            timestamp: new Date().toISOString(),
+            monotonicMs: performance.now(),
+            ...serializeCanvasError(error),
+            operation: 'setPageLayout after complete prefetchCanvasPages',
+            result: 'setPageLayout-returned-false',
+            returnValue: false,
+            requestedPage: selectedPage,
+            presentedPage: canvasPage,
+            requestedPageIndex: summaries.findIndex((summary) => summary.id === selectedPage),
+            presentedPageIndex: summaries.findIndex((summary) => summary.id === canvasPage),
+            generation: canvasGeneration,
+            requestedRevision: canvasRevision,
+            request,
+            requestedFrames: pagesToPrepare,
+            preparedFrames: prepared.map(({ page, revision }) => ({
+              page: page.id,
+              index: summaries.findIndex((summary) => summary.id === page.id),
+              revision,
+            })),
+            missingFrames: [],
+            discardedFrames: unexpectedPreparations,
+            requestedLayouts: recoveryLayouts.map(({ page, revision, ghostPages }) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+              revision,
+              ghosts: ghostPages.map(({ page: ghost }) => ({
+                page: ghost,
+                index: summaries.findIndex((summary) => summary.id === ghost),
+              })),
+            })),
+            recoveredLayouts: recoveredLayouts.map(({ page, revision }) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+              revision,
+            })),
+            canvasScrollTopBefore: recoveryScrollBefore.canvas,
+            canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+            pageRailScrollTopBefore: recoveryScrollBefore.pageRail,
+            pageRailScrollTopAfter: pageRailScrollTop(),
+            reason:
+              canvas.getLastLayoutRejection() ??
+              'WebCanvas.setPageLayout returned false without a renderer validation reason.',
+          })
+          return
+        }
+        setCanvasLayoutError(null)
+      })
+      .finally(() => canvas.unpinPageManifests(pinnedPages))
+      .catch((reason: unknown) => {
+        if (pageLayoutRequest.current !== request) {
+          traceCanvas('layout-recovery-failed-stale', {
+            operation: 'prefetchCanvasPages',
+            page: selectedPage,
+            presentedPage: canvasPage,
+            generation: canvasGeneration,
+            revision: canvasRevision,
+            requestedPageIndex: summaries.findIndex((summary) => summary.id === selectedPage),
+            presentedPageIndex: summaries.findIndex((summary) => summary.id === canvasPage),
+            requestedPages: pagesToPrepare.map((page) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+            })),
+            canvasScrollTopBefore: recoveryScrollBefore.canvas,
+            canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+            pageRailScrollTopBefore: recoveryScrollBefore.pageRail,
+            pageRailScrollTopAfter: pageRailScrollTop(),
+            result: 'discarded',
+            reason: errorMessage(reason),
+          })
+          return
+        }
+        const error = toCanvasError(reason)
+        setCanvasLayoutError(error)
+        if (process.env.NODE_ENV === 'development') {
+          console.error('[Norrix canvas]', 'layout-prefetch-failed', {
+            timestamp: new Date().toISOString(),
+            monotonicMs: performance.now(),
+            ...serializeCanvasError(reason),
+            operation: 'prefetchCanvasPages',
+            requestedPage: selectedPage,
+            presentedPage: canvasPage,
+            requestedPages: pagesToPrepare.map((page) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+            })),
+            generation: canvasGeneration,
+            requestedRevision: canvasRevision,
+            requestedPageIndex: summaries.findIndex((summary) => summary.id === selectedPage),
+            presentedPageIndex: summaries.findIndex((summary) => summary.id === canvasPage),
+            requestedFrames: pagesToPrepare.map((page) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+            })),
+            preparedFrames: [],
+            missingFrames: pagesToPrepare.map((page) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+            })),
+            discardedFrames: [],
+            canvasScrollTopBefore: recoveryScrollBefore.canvas,
+            canvasScrollTopAfter: surface.current?.scrollTop ?? null,
+            pageRailScrollTopBefore: recoveryScrollBefore.pageRail,
+            pageRailScrollTopAfter: pageRailScrollTop(),
+            requestedLayouts: pageLayouts.map(({ page, revision, ghostPages }) => ({
+              page,
+              index: summaries.findIndex((summary) => summary.id === page),
+              revision,
+              ghosts: ghostPages.map(({ page: ghost }) => ({
+                page: ghost,
+                index: summaries.findIndex((summary) => summary.id === ghost),
+              })),
+            })),
+          })
+        }
+      })
+    return () => {
+      if (pageLayoutRequest.current === request) pageLayoutRequest.current += 1
+    }
+  }, [
+    camera.zoom,
+    canvas,
+    canvasPage,
+    canvasGeneration,
+    canvasLayoutRetry,
+    canvasRevision,
+    canvasState.hasFrame,
+    canvasState.status,
+    pageLayouts,
+    pageId,
+    selectedPage,
+    scrollTop,
+    summaries,
+    viewportSize,
+    workspaceMode,
+  ])
+
+  useEffect(() => {
+    traceCanvas(canvasLayoutError ? 'canvas-layout-error-visible' : 'canvas-layout-error-hidden', {
+      operation: 'CanvasWorkspace.layout-error-overlay',
+      page: pageId ?? null,
+      revision: canvasRevision,
+      generation: canvasGeneration,
+      result: canvasLayoutError ? 'visible' : 'hidden',
+      reason: canvasLayoutError?.message ?? null,
+    })
+  }, [canvasGeneration, canvasLayoutError, canvasRevision, pageId])
 
   useEffect(() => {
     const requested = fitCanvasRequest !== appliedFitRequest.current
@@ -1150,10 +1967,25 @@ export function CanvasWorkspace() {
       if (workspaceMode === 'infinite') {
         const element = surface.current
         if (element) {
-          element.scrollTop = Math.max(
+          const nextScrollTop = Math.max(
             0,
             current.scrollTop - (physical.y - current.start.y) / window.devicePixelRatio,
           )
+          traceCanvas('infinite-scroll-position-write', {
+            operation: 'pan-gesture',
+            page: gesture.current?.kind === 'pan' ? selectedPage : null,
+            revision: useNorrixStore.getState().canvasRevision,
+            generation: useNorrixStore.getState().canvasGeneration,
+            previousScrollTop: element.scrollTop,
+            requestedScrollTop: nextScrollTop,
+            result: 'written',
+          })
+          lastInternalScrollWrite.current = {
+            operation: 'pan-gesture',
+            requestedScrollTop: nextScrollTop,
+            timestamp: new Date().toISOString(),
+          }
+          element.scrollTop = nextScrollTop
         }
         return
       }
@@ -1363,11 +2195,29 @@ export function CanvasWorkspace() {
           style={{
             cursor: page && canvasState.status === 'ready' ? canvasCursors[tool] : undefined,
             overflowY: workspaceMode === 'infinite' ? 'auto' : 'hidden',
+            overflowAnchor: 'none',
             touchAction: workspaceMode === 'infinite' ? 'auto' : 'none',
           }}
           onScroll={(event) => {
             if (workspaceMode !== 'infinite') return
             const nextScrollTop = event.currentTarget.scrollTop
+            const previousScrollTop = lastObservedScrollTop.current
+            lastObservedScrollTop.current = nextScrollTop
+            if (previousScrollTop !== null && previousScrollTop > 0 && nextScrollTop === 0) {
+              const currentStore = useNorrixStore.getState()
+              traceCanvas('infinite-scroll-reset-observed', {
+                operation: 'CanvasWorkspace.onScroll',
+                page: currentStore.selectedPage,
+                revision: currentStore.canvasRevision,
+                generation: currentStore.canvasGeneration,
+                previousScrollTop,
+                scrollTop: nextScrollTop,
+                lastInternalScrollWrite: lastInternalScrollWrite.current,
+                result: 'unexpected-top-position-observed',
+                reason:
+                  'compare the last internal scroll write with navigation and DOM lifecycle logs',
+              })
+            }
             setScrollTop(nextScrollTop)
             const currentCamera = useNorrixStore.getState().camera
             const translation = infiniteScrollTranslation(nextScrollTop, window.devicePixelRatio)
@@ -1386,7 +2236,21 @@ export function CanvasWorkspace() {
               window.devicePixelRatio,
             )
             const nextPage = summaries[index]
-            if (nextPage && nextPage.id !== selectedPage) selectPage(nextPage.id)
+            if (nextPage && nextPage.id !== selectedPage) {
+              const currentStore = useNorrixStore.getState()
+              traceCanvas('infinite-viewport-page-selected', {
+                operation: 'CanvasWorkspace.onScroll',
+                traceId: currentStore.canvasTraceId,
+                page: nextPage.id,
+                previousPage: selectedPage,
+                revision: currentStore.canvasRevision,
+                generation: currentStore.canvasGeneration,
+                scrollTop: nextScrollTop,
+                index,
+                result: 'selected-from-viewport',
+              })
+              selectPage(nextPage.id)
+            }
           }}
           onContextMenu={(event) => event.preventDefault()}
           onPointerDown={(event) => {
@@ -1735,8 +2599,7 @@ export function CanvasWorkspace() {
             if (event.ctrlKey) {
               zoom = clamp(current.zoom * Math.exp(-event.deltaY * 0.0015), 0.02, 16)
               if (workspaceMode === 'infinite') {
-                translation = infiniteScrollTranslation(event.currentTarget.scrollTop, dpr)
-                useNorrixStore.setState({ camera: { zoom, translation, fitted: false } })
+                setZoom(zoom)
                 return
               }
               const pageX = (point.x - current.translation[0]) / current.zoom
@@ -1788,6 +2651,51 @@ export function CanvasWorkspace() {
                 aria-hidden
                 className='pointer-events-none absolute inset-0 block size-full'
               />
+              {page &&
+                !canvasState.hasFrame &&
+                (canvasState.status === 'loading' ||
+                  canvasState.status === 'switching' ||
+                  canvasState.status === 'recovering') && (
+                  <div
+                    role='status'
+                    data-testid='canvas-frame-loading'
+                    data-page={page.id}
+                    data-generation={canvasGeneration}
+                    className='absolute inset-0 z-20 grid place-items-center bg-black p-6 text-white'
+                  >
+                    <div className='flex max-w-sm flex-col items-center gap-3 text-center'>
+                      <LoaderCircle className='size-8 animate-spin' aria-hidden='true' />
+                      <p className='text-lg font-medium'>{t('common.loading')}</p>
+                      <p className='text-xs text-white/70'>
+                        {page.label} · {page.id} · {canvasGeneration}
+                      </p>
+                    </div>
+                  </div>
+                )}
+              {canvasLayoutError && (
+                <div
+                  role='alert'
+                  data-testid='canvas-layout-error'
+                  className='absolute top-3 right-3 z-30 max-w-lg rounded-lg border border-border/70 bg-[var(--surface-panel)] p-3 text-foreground shadow-lg'
+                >
+                  <div className='flex items-start gap-3'>
+                    <div className='min-w-0'>
+                      <p className='text-sm font-medium'>{t('canvas.unavailable')}</p>
+                      <p className='mt-1 text-xs leading-relaxed text-muted-foreground'>
+                        {canvasLayoutError.message}
+                      </p>
+                    </div>
+                    <Button
+                      data-canvas-control
+                      size='sm'
+                      variant='outline'
+                      onClick={() => setCanvasLayoutRetry((attempt) => attempt + 1)}
+                    >
+                      {t('errors.tryAgain')}
+                    </Button>
+                  </div>
+                </div>
+              )}
               {(canvasState.status === 'ready' || preserveTextEditor) &&
                 overlayPages.map((overlay) => (
                   <CanvasOverlay
@@ -1925,6 +2833,66 @@ function fitWidthCamera(viewportWidth: number, pageWidth: number): CanvasView {
 function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message
   return typeof error === 'string' ? error : 'The WebGPU canvas returned an unknown error.'
+}
+
+function pageRailScrollTop(): number | null {
+  if (typeof document === 'undefined') return null
+  return document.querySelector<HTMLElement>('[data-norrix-page-rail-viewport]')?.scrollTop ?? null
+}
+
+function toCanvasError(reason: unknown): Error {
+  if (reason instanceof Error) return reason
+  const serialized = serializeCanvasError(reason)
+  return new Error(serialized.message, { cause: reason })
+}
+
+function serializeCanvasError(reason: unknown): {
+  name: string
+  message: string
+  stack: string | null
+  cause: unknown
+} {
+  const seen = new WeakSet<object>()
+  const serialize = (value: unknown, depth: number): unknown => {
+    if (depth > 5) return '[cause depth limit]'
+    if (value === null || typeof value !== 'object') {
+      return typeof value === 'string' ? value : String(value)
+    }
+    if (seen.has(value)) return '[circular cause]'
+    seen.add(value)
+    const candidate = value as {
+      name?: unknown
+      message?: unknown
+      stack?: unknown
+      cause?: unknown
+    }
+    return {
+      name:
+        typeof candidate.name === 'string' ? candidate.name : (value.constructor?.name ?? 'Error'),
+      message:
+        typeof candidate.message === 'string'
+          ? candidate.message
+          : (() => {
+              try {
+                return JSON.stringify(value)
+              } catch {
+                return String(value)
+              }
+            })(),
+      stack: typeof candidate.stack === 'string' ? candidate.stack : null,
+      cause: 'cause' in candidate ? serialize(candidate.cause, depth + 1) : null,
+    }
+  }
+  const serialized = serialize(reason, 0)
+  if (typeof serialized === 'object' && serialized !== null) {
+    return serialized as {
+      name: string
+      message: string
+      stack: string | null
+      cause: unknown
+    }
+  }
+  return { name: 'ThrownValue', message: String(serialized), stack: null, cause: null }
 }
 
 function clampCameraTranslation(

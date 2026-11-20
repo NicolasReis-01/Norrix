@@ -10,9 +10,9 @@ use anyhow::{Context as _, Result};
 use clap::{Parser, ValueEnum};
 use norrix_config::Config;
 use norrix_pipeline::{
-    Committer, DetectionModel, Flux2KleinConfig, InpaintingModel, KoharuLayoutRFDetrSeg2XLConfig,
-    OcrModel, Operation, Pipeline, PipelineConfig, Progress, Request, RoremMixedConfig, Scope,
-    StageOutput, TranslationConfig,
+    CommitResult, Committer, DetectionModel, Flux2KleinConfig, InpaintingModel,
+    KoharuLayoutRFDetrSeg2XLConfig, OcrModel, Operation, Pipeline, PipelineConfig, Progress,
+    Request, RoremMixedConfig, Scope, StageOutput, TranslationConfig,
 };
 use norrix_rasterizer::{RasterOptions, Rasterizer};
 use norrix_renderer::Renderer;
@@ -54,8 +54,10 @@ struct SessionCommitter<'a>(&'a mut Session);
 
 #[async_trait::async_trait]
 impl Committer for SessionCommitter<'_> {
-    async fn commit(&mut self, output: StageOutput) -> Result<norrix_scene::Snapshot> {
-        Ok(self.0.commit(output.patch).await?.snapshot)
+    async fn commit(&mut self, output: StageOutput) -> Result<CommitResult> {
+        Ok(CommitResult::Applied(
+            self.0.commit(output.patch).await?.snapshot,
+        ))
     }
 }
 

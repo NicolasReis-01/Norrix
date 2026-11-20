@@ -21,20 +21,23 @@ pub use language::Language;
 pub use model::{GenerationConfig, Model, ModelSelection, Quantization};
 pub(crate) use model::{ModelGeneration, QuantizationDefinition, display_name};
 pub use provider::{Provider, ProviderConfig, ProvidersConfig};
-pub use remote::{GeminiApiKeyInfo, GeminiApiKeyStatus, GeminiApiKeyTestResult};
+pub use remote::{
+    GeminiApiKeyInfo, GeminiApiKeyManualStatus, GeminiApiKeyStatus, GeminiApiKeyTestResult,
+    GeminiKeyFailure, GeminiRotationEvent,
+};
 
 pub fn set_gemini_api_keys(keys: &[norrix_secrets::SecretString]) -> anyhow::Result<()> {
     remote::set_gemini_api_keys(keys)
 }
 
-pub fn set_gemini_primary_api_key(key: norrix_secrets::SecretString) -> anyhow::Result<()> {
-    remote::set_gemini_primary_api_key(key)
+pub fn add_gemini_api_key(key: norrix_secrets::SecretString) -> anyhow::Result<()> {
+    remote::add_gemini_api_key(key)
 }
 
-pub fn set_gemini_primary_api_key_with_info(
+pub fn add_gemini_api_key_with_info(
     key: norrix_secrets::SecretString,
 ) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
-    remote::set_gemini_primary_api_key_with_info(key)
+    remote::add_gemini_api_key_with_info(key)
 }
 
 pub fn clear_gemini_api_keys() -> anyhow::Result<()> {
@@ -53,24 +56,26 @@ pub fn gemini_api_key_info() -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
     remote::gemini_api_key_info()
 }
 
-pub fn add_gemini_secondary_api_key(key: norrix_secrets::SecretString) -> anyhow::Result<()> {
-    remote::add_gemini_secondary_api_key(key)
+pub fn set_gemini_api_key_manual_status(
+    id: &str,
+    status: Option<GeminiApiKeyManualStatus>,
+) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
+    remote::set_gemini_api_key_manual_status(id, status)
 }
 
-pub fn add_gemini_secondary_api_key_with_info(
+pub fn subscribe_gemini_rotation_events() -> tokio::sync::broadcast::Receiver<GeminiRotationEvent> {
+    remote::subscribe_gemini_rotation_events()
+}
+
+pub fn replace_gemini_api_key_with_info(
+    id: &str,
     key: norrix_secrets::SecretString,
 ) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
-    remote::add_gemini_secondary_api_key_with_info(key)
+    remote::replace_gemini_api_key_with_info(id, key)
 }
 
-pub fn remove_gemini_secondary_api_key(id: &str) -> anyhow::Result<()> {
-    remote::remove_gemini_secondary_api_key(id)
-}
-
-pub fn remove_gemini_secondary_api_key_with_info(
-    id: &str,
-) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
-    remote::remove_gemini_secondary_api_key_with_info(id)
+pub fn remove_gemini_api_key_with_info(id: &str) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
+    remote::remove_gemini_api_key_with_info(id)
 }
 
 pub async fn test_gemini_api_key(id: &str) -> anyhow::Result<GeminiApiKeyTestResult> {

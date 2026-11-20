@@ -1,6 +1,13 @@
 //! Native page preparation shared by browser presentation and export.
 
-use std::{collections::HashSet, future::Future, sync::Arc};
+use std::{
+    collections::HashSet,
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+};
 
 use anyhow::{Context as _, Result, bail};
 use norrix_rasterizer::{Rasterizer, ResourceId};
@@ -59,6 +66,7 @@ pub struct TextLayoutPreview {
 
 #[derive(Clone, Debug, Serialize, Type)]
 pub struct CanvasState {
+    pub trace_id: String,
     pub page: Option<EntityId>,
     pub revision: Option<Revision>,
     #[specta(type = f64)]
@@ -70,11 +78,22 @@ pub struct CanvasState {
 
 #[derive(Default)]
 struct PresentationState {
+    trace_id: String,
     generation: u64,
     frame: Option<RenderedFrame>,
     requested_preparation: u64,
     requested_revision: Option<Revision>,
     requested_page: Option<EntityId>,
+}
+
+static NEXT_CANVAS_TRACE_ID: AtomicU64 = AtomicU64::new(1);
+
+fn next_canvas_trace_id() -> String {
+    format!(
+        "canvas-{}-{}",
+        std::process::id(),
+        NEXT_CANVAS_TRACE_ID.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 const MAX_CACHED_PAGE_FRAMES: usize = 8;
@@ -141,15 +160,60 @@ impl Desktop {
             .map_err(Into::into)
     }
 
-    pub async fn prepare_page(&self, snapshot: &Snapshot, page: EntityId) -> Result<bool> {
+    pub async fn prepare_page(
+        &self,
+        snapshot: &Snapshot,
+        page: EntityId,
+        trace_id: Option<&str>,
+    ) -> Result<bool> {
         let _preparation = self.preparation.lock().await;
         let revision = snapshot.revision();
         let cached = self.page_frames.lock().get(page, revision);
         if cached.is_some() {
+            tracing::info!(
+                event = "canvas_page_preparation_finished",
+                trace_id = trace_id.unwrap_or("untracked"),
+                page = %page,
+                requested_revision = %revision,
+                prepared_revision = %revision,
+                cache = "reused",
+                result = "prepared",
+            );
             return Ok(true);
         }
-        let frame = self.renderer.render(snapshot, page).await?;
+        tracing::info!(
+            event = "canvas_page_preparation_started",
+            trace_id = trace_id.unwrap_or("untracked"),
+            page = %page,
+            requested_revision = %revision,
+            cache = "miss",
+            result = "started",
+        );
+        let frame = match self.renderer.render(snapshot, page).await {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::error!(
+                    event = "canvas_page_preparation_finished",
+                    trace_id = trace_id.unwrap_or("untracked"),
+                    page = %page,
+                    requested_revision = %revision,
+                    cache = "miss",
+                    result = "failed",
+                );
+                return Err(error.into());
+            }
+        };
+        let prepared_revision = frame.revision();
         self.page_frames.lock().insert(frame);
+        tracing::info!(
+            event = "canvas_page_preparation_finished",
+            trace_id = trace_id.unwrap_or("untracked"),
+            page = %page,
+            requested_revision = %revision,
+            prepared_revision = %prepared_revision,
+            cache = "updated",
+            result = "prepared",
+        );
         Ok(true)
     }
 
@@ -249,6 +313,7 @@ impl Desktop {
         let presentation = self.presentation.read();
         let Some(frame) = presentation.frame.as_ref() else {
             return CanvasState {
+                trace_id: presentation.trace_id.clone(),
                 page: None,
                 revision: None,
                 generation: presentation.generation,
@@ -261,6 +326,7 @@ impl Desktop {
         let element_frames = element_frames(frame);
         let text_font_sizes = text_font_sizes(frame);
         CanvasState {
+            trace_id: presentation.trace_id.clone(),
             page: Some(frame.page()),
             revision: Some(frame.revision()),
             generation: presentation.generation,
@@ -318,8 +384,7 @@ impl Desktop {
                 height: original.height,
                 angle_degrees: original.angle_degrees,
             };
-            let resized = (original.width - element.frame.width).abs() > 0.01
-                || (original.height - element.frame.height).abs() > 0.01;
+            let diagonal_resize = is_diagonal_resize(original, element.frame);
             let coefficients = frame_transform(original, element.frame);
             let geometry = Geometry {
                 origin: layer.geometry().origin.clone(),
@@ -337,7 +402,7 @@ impl Desktop {
                     element.element,
                     geometry,
                     element.frame.angle_degrees,
-                    resized,
+                    diagonal_resize,
                 ));
             }
         }
@@ -351,11 +416,68 @@ impl Desktop {
         page: Option<EntityId>,
         commit: &Commit,
     ) -> Result<bool> {
+        self.synchronize_with_context(snapshot, page, commit, None, None)
+            .await
+    }
+
+    pub async fn synchronize_with_context(
+        &self,
+        snapshot: &Snapshot,
+        page: Option<EntityId>,
+        commit: &Commit,
+        job_id: Option<&str>,
+        processed_page: Option<EntityId>,
+    ) -> Result<bool> {
+        let trace_id = next_canvas_trace_id();
+        let (previous_page, previous_revision, previous_generation) = {
+            let presentation = self.presentation.read();
+            (
+                presentation.frame.as_ref().map(RenderedFrame::page),
+                presentation.frame.as_ref().map(RenderedFrame::revision),
+                presentation.generation,
+            )
+        };
+        tracing::info!(
+            event = "canvas_sync_started",
+            trace_id,
+            job_id = job_id.unwrap_or("unavailable"),
+            processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+            active_page = %page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            previous_page = %previous_page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            previous_revision = %previous_revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+            new_revision = %snapshot.revision(),
+            previous_generation,
+            result = "started",
+        );
         let Some(request) = self.request_synchronization(snapshot.revision(), page, false) else {
+            tracing::warn!(
+                event = "canvas_sync_finished",
+                trace_id,
+                job_id = job_id.unwrap_or("unavailable"),
+                processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+                active_page = %page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                previous_revision = %previous_revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+                new_revision = %snapshot.revision(),
+                previous_generation,
+                result = "rejected",
+                reason = "a newer revision or conflicting page synchronization is already pending",
+            );
             return Ok(false);
         };
         let _preparation = self.preparation.lock().await;
         if !self.is_current_preparation(request) {
+            tracing::warn!(
+                event = "canvas_sync_finished",
+                trace_id,
+                job_id = job_id.unwrap_or("unavailable"),
+                processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+                active_page = %page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                previous_revision = %previous_revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+                new_revision = %snapshot.revision(),
+                previous_generation,
+                result = "rejected",
+                reason = "synchronization request was superseded while waiting for preparation",
+            );
             return Ok(false);
         }
         let (current_page, revision, previous) = {
@@ -368,21 +490,96 @@ impl Desktop {
             )
         };
         if current_page != page {
-            return self.show_page_locked(snapshot, page, request).await;
+            tracing::info!(
+                event = "canvas_sync_render_strategy",
+                trace_id,
+                page = %page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                previous_revision = %revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+                new_revision = %snapshot.revision(),
+                strategy = "full_render",
+                reason = "presented page differs from active page",
+            );
+            let result = match self
+                .show_page_locked(snapshot, page, request, &trace_id)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    tracing::error!(
+                        event = "canvas_sync_finished",
+                        trace_id,
+                        job_id = job_id.unwrap_or("unavailable"),
+                        processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+                        active_page = %page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+                        new_revision = %snapshot.revision(),
+                        result = "failed",
+                        reason = "full render failed",
+                    );
+                    return Err(error.into());
+                }
+            };
+            self.log_sync_finished(
+                &trace_id,
+                job_id,
+                processed_page,
+                page,
+                revision,
+                snapshot,
+                result,
+                "presented page differs from active page",
+            );
+            return Ok(result);
         }
         if revision.is_some_and(|revision| revision >= snapshot.revision()) {
+            self.log_sync_finished(
+                &trace_id,
+                job_id,
+                processed_page,
+                page,
+                revision,
+                snapshot,
+                false,
+                "presented revision is already current or newer",
+            );
             return Ok(false);
         }
         let Some(page) = page else {
-            if self.replace_frame_if_current(request, None) {
+            let replaced = self.replace_frame_if_current(request, None, &trace_id);
+            if replaced {
                 self.renderer.discard_retained_nodes();
             }
+            self.log_sync_finished(
+                &trace_id,
+                job_id,
+                processed_page,
+                None,
+                revision,
+                snapshot,
+                replaced,
+                if replaced {
+                    "no active page; cleared presentation"
+                } else {
+                    "frame replacement rejected"
+                },
+            );
             return Ok(false);
         };
-        let rendered = if commit.revision == snapshot.revision()
+        let incremental = commit.revision == snapshot.revision()
             && revision == Some(commit.changes.from)
-            && let Some(previous) = previous.as_ref()
-        {
+            && previous.is_some();
+        tracing::info!(
+            event = "canvas_sync_render_strategy",
+            trace_id,
+            page = %page,
+            previous_revision = %revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+            new_revision = %snapshot.revision(),
+            strategy = if incremental { "incremental_update" } else { "full_render" },
+            reason = if incremental { "contiguous commit revision" } else { "incremental update preconditions not met" },
+        );
+        let rendered = if incremental {
+            let previous = previous
+                .as_ref()
+                .expect("incremental update requires the previous frame");
             self.await_preparation(
                 request,
                 self.renderer.update(previous, snapshot, &commit.changes),
@@ -393,17 +590,64 @@ impl Desktop {
                 .await
         };
         let Some(rendered) = rendered else {
+            self.log_sync_finished(
+                &trace_id,
+                job_id,
+                processed_page,
+                Some(page),
+                revision,
+                snapshot,
+                false,
+                "render request was superseded",
+            );
             return Ok(false);
         };
-        let rendered = rendered?;
-        if !self.replace_frame_if_current(request, Some(rendered)) {
+        let rendered = match rendered {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                tracing::error!(
+                    event = "canvas_sync_finished",
+                    trace_id,
+                    job_id = job_id.unwrap_or("unavailable"),
+                    processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+                    active_page = %page,
+                    previous_revision = %revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+                    new_revision = %snapshot.revision(),
+                    result = "failed",
+                    reason = "renderer update or full render failed",
+                );
+                return Err(error.into());
+            }
+        };
+        if !self.replace_frame_if_current(request, Some(rendered), &trace_id) {
+            self.log_sync_finished(
+                &trace_id,
+                job_id,
+                processed_page,
+                Some(page),
+                revision,
+                snapshot,
+                false,
+                "frame replacement rejected because request was superseded",
+            );
             return Ok(false);
         }
+        self.log_sync_finished(
+            &trace_id,
+            job_id,
+            processed_page,
+            Some(page),
+            revision,
+            snapshot,
+            true,
+            "frame replacement accepted",
+        );
         Ok(true)
     }
 
     #[tracing::instrument(skip_all)]
     pub async fn show_page(&self, snapshot: &Snapshot, page: Option<EntityId>) -> Result<bool> {
+        let trace_id = next_canvas_trace_id();
         let Some(request) = self.request_synchronization(snapshot.revision(), page, true) else {
             return Ok(false);
         };
@@ -411,7 +655,37 @@ impl Desktop {
         if !self.is_current_preparation(request) {
             return Ok(false);
         }
-        self.show_page_locked(snapshot, page, request).await
+        self.show_page_locked(snapshot, page, request, &trace_id)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn log_sync_finished(
+        &self,
+        trace_id: &str,
+        job_id: Option<&str>,
+        processed_page: Option<EntityId>,
+        active_page: Option<EntityId>,
+        previous_revision: Option<Revision>,
+        snapshot: &Snapshot,
+        accepted: bool,
+        reason: &str,
+    ) {
+        let presentation = self.presentation.read();
+        tracing::info!(
+            event = "canvas_sync_finished",
+            trace_id,
+            job_id = job_id.unwrap_or("unavailable"),
+            processed_page = %processed_page.map_or_else(|| "unavailable".to_owned(), |id| id.to_string()),
+            active_page = %active_page.map_or_else(|| "none".to_owned(), |id| id.to_string()),
+            previous_revision = %previous_revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+            new_revision = %snapshot.revision(),
+            new_generation = presentation.generation,
+            presented_page = %presentation.frame.as_ref().map_or_else(|| "none".to_owned(), |frame| frame.page().to_string()),
+            presented_revision = %presentation.frame.as_ref().map_or_else(|| "none".to_owned(), |frame| frame.revision().to_string()),
+            result = if accepted { "accepted" } else { "rejected" },
+            reason,
+        );
     }
 
     pub async fn clear(&self) {
@@ -420,7 +694,8 @@ impl Desktop {
         if !self.is_current_preparation(request) {
             return;
         }
-        if self.replace_frame_if_current(request, None) {
+        let trace_id = next_canvas_trace_id();
+        if self.replace_frame_if_current(request, None, &trace_id) {
             self.renderer.discard_retained_nodes();
         }
     }
@@ -430,12 +705,13 @@ impl Desktop {
         snapshot: &Snapshot,
         page: Option<EntityId>,
         request: u64,
+        trace_id: &str,
     ) -> Result<bool> {
         if !self.is_current_preparation(request) {
             return Ok(false);
         }
         let Some(page) = page else {
-            let replaced = self.replace_frame_if_current(request, None);
+            let replaced = self.replace_frame_if_current(request, None, trace_id);
             if replaced {
                 self.renderer.discard_retained_nodes();
             }
@@ -443,7 +719,7 @@ impl Desktop {
         };
         let cached = self.page_frames.lock().get(page, snapshot.revision());
         if let Some(frame) = cached {
-            return Ok(self.replace_frame_if_current(request, Some(frame)));
+            return Ok(self.replace_frame_if_current(request, Some(frame), trace_id));
         }
         let Some(frame) = self
             .await_preparation(request, self.renderer.render(snapshot, page))
@@ -452,7 +728,7 @@ impl Desktop {
             return Ok(false);
         };
         let frame = frame?;
-        if !self.replace_frame_if_current(request, Some(frame)) {
+        if !self.replace_frame_if_current(request, Some(frame), trace_id) {
             return Ok(false);
         }
         Ok(true)
@@ -520,13 +796,37 @@ impl Desktop {
         }
     }
 
-    fn replace_frame_if_current(&self, request: u64, frame: Option<RenderedFrame>) -> bool {
+    fn replace_frame_if_current(
+        &self,
+        request: u64,
+        frame: Option<RenderedFrame>,
+        trace_id: &str,
+    ) -> bool {
         let mut presentation = self.presentation.write();
         if presentation.requested_preparation != request {
+            tracing::warn!(
+                event = "canvas_frame_replacement",
+                trace_id,
+                requested_preparation = request,
+                current_preparation = presentation.requested_preparation,
+                requested_revision = %presentation.requested_revision.map_or_else(|| "none".to_owned(), |revision| revision.to_string()),
+                requested_page = %presentation.requested_page.map_or_else(|| "none".to_owned(), |page| page.to_string()),
+                result = "rejected",
+                reason = "a newer preparation request superseded this frame",
+            );
             return false;
         }
         presentation.generation = presentation.generation.wrapping_add(1).max(1);
+        presentation.trace_id = trace_id.to_owned();
         presentation.frame.clone_from(&frame);
+        tracing::info!(
+            event = "canvas_frame_replacement",
+            trace_id,
+            page = %frame.as_ref().map_or_else(|| "none".to_owned(), |frame| frame.page().to_string()),
+            revision = %frame.as_ref().map_or_else(|| "none".to_owned(), |frame| frame.revision().to_string()),
+            generation = presentation.generation,
+            result = "accepted",
+        );
         drop(presentation);
         if let Some(frame) = frame {
             self.page_frames.lock().insert(frame);
@@ -651,6 +951,10 @@ fn frame_transform(original: Frame, preview: Frame) -> [f64; 6] {
     ]
 }
 
+fn is_diagonal_resize(original: Frame, next: Frame) -> bool {
+    (original.width - next.width).abs() > 0.01 && (original.height - next.height).abs() > 0.01
+}
+
 fn transform_point([a, b, c, d, e, f]: [f64; 6], point: &Point) -> Point {
     Point {
         x: a * point.x + c * point.y + e,
@@ -665,7 +969,40 @@ mod tests {
     use norrix_scene::Revision;
     use tokio::{sync::Notify, time::timeout};
 
-    use super::Desktop;
+    use super::{Desktop, Frame, is_diagonal_resize};
+
+    #[test]
+    fn only_diagonal_resizes_allow_automatic_font_adjustment() {
+        let original = Frame {
+            x: 10.0,
+            y: 20.0,
+            width: 100.0,
+            height: 50.0,
+            angle_degrees: 0.0,
+        };
+        assert!(!is_diagonal_resize(
+            original,
+            Frame {
+                width: 120.0,
+                ..original
+            }
+        ));
+        assert!(!is_diagonal_resize(
+            original,
+            Frame {
+                height: 70.0,
+                ..original
+            }
+        ));
+        assert!(is_diagonal_resize(
+            original,
+            Frame {
+                width: 120.0,
+                height: 70.0,
+                ..original
+            }
+        ));
+    }
 
     #[tokio::test]
     async fn newer_request_preempts_current_preparation_and_acquires_ownership() {
@@ -704,10 +1041,11 @@ mod tests {
         let obsolete = desktop.request_preparation();
         let latest = desktop.request_preparation();
 
-        assert!(!desktop.replace_frame_if_current(obsolete, None));
+        assert!(!desktop.replace_frame_if_current(obsolete, None, "test-obsolete"));
         assert_eq!(desktop.canvas_state().generation, 0);
-        assert!(desktop.replace_frame_if_current(latest, None));
+        assert!(desktop.replace_frame_if_current(latest, None, "test-latest"));
         assert_eq!(desktop.canvas_state().generation, 1);
+        assert_eq!(desktop.canvas_state().trace_id, "test-latest");
     }
 
     #[tokio::test]

@@ -12,10 +12,10 @@ import {
   Sun,
   Type,
 } from 'lucide-react'
-import { useTheme } from 'next-themes'
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
+import { useTheme } from '@/components/app/ThemeProvider'
 import { PipelinePreferences } from '@/components/preferences/PipelinePreferences'
 import {
   PreferencePage,
@@ -69,6 +69,7 @@ export function SettingsPage() {
   const [typesetting, setTypesetting] = useState<TypesettingConfig | null>(
     preferences?.typesetting ?? null,
   )
+  const [view, setView] = useState(preferences?.view ?? null)
   const translation = pipeline?.translation ?? null
   const lastSaved = useRef<string | null>(null)
   const lastSavedProviders = useRef<string | null>(null)
@@ -77,15 +78,18 @@ export function SettingsPage() {
   const lastPending = useRef<{ serialized: string; promise: Promise<Preferences> } | null>(null)
   const currentDraft = useRef<string | null>(null)
   currentDraft.current =
-    pipeline && providers && typesetting ? JSON.stringify([pipeline, providers, typesetting]) : null
+    pipeline && providers && typesetting && view
+      ? JSON.stringify([pipeline, providers, typesetting, view])
+      : null
 
   const saveDraft = useCallback(
     async (
       pipeline: PipelineConfig,
       providers: ProviderSettings,
       typesetting: TypesettingConfig,
+      view: Preferences['view'],
     ) => {
-      const serialized = JSON.stringify([pipeline, providers, typesetting])
+      const serialized = JSON.stringify([pipeline, providers, typesetting, view])
       if (serialized === lastSaved.current) {
         const pending = lastPending.current
         if (pending?.serialized === serialized) await pending.promise
@@ -97,7 +101,7 @@ export function SettingsPage() {
       const generation = ++saveGeneration.current
       const pending = saveQueue.current
         .catch(() => undefined)
-        .then(() => savePreferences(pipeline, providers, typesetting))
+        .then(() => savePreferences(pipeline, providers, typesetting, view))
       lastPending.current = { serialized, promise: pending }
       saveQueue.current = pending.then(
         () => undefined,
@@ -131,25 +135,27 @@ export function SettingsPage() {
     setPipeline(preferences?.pipeline ?? null)
     setProviders(preferences?.providers ?? null)
     setTypesetting(preferences?.typesetting ?? null)
+    setView(preferences?.view ?? null)
     if (preferences) {
       lastSaved.current = JSON.stringify([
         preferences.pipeline,
         preferences.providers,
         preferences.typesetting,
+        preferences.view,
       ])
       lastSavedProviders.current = JSON.stringify(preferences.providers)
     }
   }, [open, preferences])
 
   useEffect(() => {
-    if (!open || !pipeline || !providers || !typesetting) return
-    const serialized = JSON.stringify([pipeline, providers, typesetting])
+    if (!open || !pipeline || !providers || !typesetting || !view) return
+    const serialized = JSON.stringify([pipeline, providers, typesetting, view])
     if (serialized === lastSaved.current) return
     const timeout = window.setTimeout(() => {
-      void saveDraft(pipeline, providers, typesetting).catch(() => undefined)
+      void saveDraft(pipeline, providers, typesetting, view).catch(() => undefined)
     }, 260)
     return () => window.clearTimeout(timeout)
-  }, [open, pipeline, providers, saveDraft, typesetting])
+  }, [open, pipeline, providers, saveDraft, typesetting, view])
 
   if (!open) return null
 
@@ -161,11 +167,11 @@ export function SettingsPage() {
           variant='ghost'
           className='mb-5 h-9 justify-start gap-2 rounded-lg px-2 text-[12px] text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground'
           onClick={() => {
-            if (!pipeline || !providers || !typesetting) {
+            if (!pipeline || !providers || !typesetting || !view) {
               setOpen(false)
               return
             }
-            void saveDraft(pipeline, providers, typesetting)
+            void saveDraft(pipeline, providers, typesetting, view)
               .then(() => setOpen(false))
               .catch(() => undefined)
           }}

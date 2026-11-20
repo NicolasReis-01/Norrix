@@ -126,11 +126,73 @@ async fn built_in_component_schema_revisions_are_explicit() {
             schema::<TextContent>(),
             schema::<crate::components::Assets>(),
             schema::<Relation>(),
+            schema::<PipelineProgress>(),
+            schema::<OriginalFontEstimate>(),
         ],
-        [1; 17]
+        [1; 19]
+    );
+    assert_eq!(
+        [
+            <ProgressOrigin as revision::Revisioned>::revision(),
+            <ProgressStatus as revision::Revisioned>::revision(),
+        ],
+        [1; 2]
     );
     assert_eq!(schema::<TextLayout>(), 2);
-    assert_eq!(schema::<Typography>(), 2);
+    assert_eq!(schema::<Typography>(), 3);
+}
+
+#[tokio::test]
+async fn pipeline_progress_round_trips_with_stable_entity_identity() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("progress.khrproj");
+    let mut session = Session::create(&path).await.unwrap();
+    let mut edit = session.snapshot().edit();
+    let page = edit
+        .add_page(PageDraft::new("progress", 100.0, 100.0), At::End)
+        .unwrap();
+    edit.add_page(PageDraft::new("other", 100.0, 100.0), At::End)
+        .unwrap();
+    let content = edit.add_text_content(page, At::End).unwrap();
+    let mut page_progress = PipelineProgress::default();
+    page_progress.set(
+        ProgressKind::Detection,
+        Some(ProgressStatus::Complete(ProgressOrigin::Manual)),
+    );
+    edit.set(page, &page_progress).unwrap();
+    let mut text_progress = PipelineProgress::default();
+    text_progress.set(
+        ProgressKind::Translation,
+        Some(ProgressStatus::Complete(ProgressOrigin::Automatic)),
+    );
+    edit.set(content, &text_progress).unwrap();
+    session.commit(edit.finish().unwrap()).await.unwrap();
+
+    let reordered = session
+        .snapshot()
+        .patch(|edit| edit.move_entity(page, None, At::End))
+        .unwrap();
+    session.commit(reordered).await.unwrap();
+    drop(session);
+    let reopened = Session::open(&path).await.unwrap();
+    let snapshot = reopened.snapshot();
+
+    assert_eq!(
+        snapshot
+            .component::<PipelineProgress>(page)
+            .unwrap()
+            .unwrap()
+            .status(ProgressKind::Detection),
+        Some(ProgressStatus::Complete(ProgressOrigin::Manual))
+    );
+    assert_eq!(
+        snapshot
+            .component::<PipelineProgress>(content)
+            .unwrap()
+            .unwrap()
+            .status(ProgressKind::Translation),
+        Some(ProgressStatus::Complete(ProgressOrigin::Automatic))
+    );
 }
 
 #[tokio::test]
@@ -1073,6 +1135,7 @@ async fn independent_pipeline_components_rebase() {
                     font_style: Some(FontStyle::Italic),
                     size: Some(24.0),
                     auto_fit: false,
+                    auto_fit_size: None,
                     color: Some([1, 2, 3, 255]),
                     stroke_color: None,
                     stroke_width: None,

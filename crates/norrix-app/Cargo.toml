@@ -20,6 +20,7 @@ futures = { workspace = true }
 hayro = { workspace = true }
 image = { workspace = true }
 norrix-agent = { workspace = true }
+norrix-config = { workspace = true }
 norrix-desktop = { workspace = true }
 norrix-ml = { workspace = true }
 norrix-metrics = { workspace = true }

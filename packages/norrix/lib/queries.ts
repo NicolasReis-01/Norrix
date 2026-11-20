@@ -99,7 +99,11 @@ export function useWorkspacePage(enabled = true) {
         })
       }
       if (workspaceMode === 'infinite') return Promise.resolve(null)
-      return call(commands.prepareCanvasPage, selectedPage)
+      return call(
+        commands.prepareCanvasPage,
+        selectedPage,
+        `workspace-page-${selectedPage}-${Date.now()}`,
+      )
     },
     enabled: enabled && selectedPage !== null,
     select: (preparation) => preparation?.page ?? null,
@@ -111,7 +115,7 @@ export function usePreparedPages(pageIds: string[]) {
   return useQueries({
     queries: pageIds.map((page) => ({
       queryKey: preparedPageKey(page),
-      queryFn: () => call(commands.prepareCanvasPage, page),
+      queryFn: () => call(commands.prepareCanvasPage, page, `prepared-page-${page}-${Date.now()}`),
       enabled: false,
     })),
   })

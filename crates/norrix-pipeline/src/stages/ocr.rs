@@ -178,7 +178,8 @@ impl Model {
         for result in results {
             let language = result
                 .previous
-                .and_then(|value| value.language)
+                .as_ref()
+                .and_then(|value| value.language.clone())
                 .or_else(|| LanguageTag::new("ja-JP").ok());
             edit.set(
                 result.content,

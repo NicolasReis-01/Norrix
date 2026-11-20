@@ -4,13 +4,13 @@ default-members = ["crates/norrix"]
 resolver = "3"
 
 [workspace.package]
-version = "0.83.5"
+version = "0.71.2"
 edition = "2024"
 description = "Manga translation tools"
 license = "MIT OR Apache-2.0"
 authors = [
-    "Mayo Takanashi <mayo@linux.com>",
-    "Wangchong Zhou <fffonion@gmail.com>",
+    "Mayo Takanashi",
+    "Wangchong Zhou",
 ]
 readme = "README.md"
 homepage = "https://koharu.rs"
@@ -59,7 +59,7 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 specta = { version = "=2.0.0-rc.25", features = ["derive", "url", "uuid"] }
 specta-typescript = "=0.0.12"
-tokio = { version = "1.53.1", features = ["full"] }
+tokio = { version = "1.53.3", features = ["full"] }
 tokio-rayon = "2.1.0"
 log = "0.4.34"
 tracing = "0.1.44"
@@ -79,7 +79,7 @@ strum = { version = "0.28.0", features = ["derive"] }
 sys-locale = "0.3.2"
 sysinfo = { version = "0.39.6", features = ["system"] }
 rars = "0.9.4"
-zip = { version = "8.6.0", features = ["deflate"] }
+zip = { version = "9.0.5", features = ["deflate"] }
 dirs = "7.0.0"
 futures = "0.3.34"
 futures-channel = "0.3.34"
@@ -141,7 +141,7 @@ uuid = { version = "1.26.0", features = ["v4", "v7", "serde"] }
 atomicwrites = "0.4.4"
 fs4 = "1.1.0"
 parking_lot = "0.12.5"
-postcard = { version = "1.1.3", features = ["use-std"] }
+postcard = { version = "1.1.3", default-features = false, features = ["use-std"] }
 walkdir = "2.5.0"
 base64 = "0.23.1"
 unicode-bidi = "0.3.18"
@@ -175,6 +175,9 @@ memmap2 = "0.9.11"
 
 [profile.dev]
 debug = 1
+
+[profile.dev.package."*"]
+debug = 0
 
 [profile.dev.package.blake3]
 opt-level = 3

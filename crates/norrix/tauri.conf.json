@@ -41,6 +41,10 @@
     ],
     "createUpdaterArtifacts": false,
     "license": "MIT OR Apache-2.0",
-    "resources": ["../../LICENSE-MIT", "../../LICENSE-APACHE"]
+    "resources": [
+      "../../LICENSE-MIT",
+      "../../LICENSE-APACHE",
+      "../../packages/norrix/app/fonts/OFL.txt"
+    ]
   }
 }

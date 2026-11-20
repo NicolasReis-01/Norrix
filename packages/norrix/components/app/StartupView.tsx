@@ -8,9 +8,7 @@ import { useTranslation } from 'react-i18next'
 import { useMacOS, WindowControls } from '@/components/app/WindowChrome'
 import {
   POWER_ON_FADE_DURATION_MS,
-  POWER_ON_FADE_OUT_AT_MS,
-  POWER_ON_HARD_STOP_AT_MS,
-  POWER_ON_MAX_DURATION_MS,
+  POWER_ON_MIN_DURATION_MS,
   powerOnMedia,
   type PowerOnMedia,
 } from '@/lib/power-on-config'
@@ -139,7 +137,7 @@ interface PowerOnScreenProps extends StartupViewProps {
 export function PowerOnScreen({ media, onDismiss, ready }: PowerOnScreenProps) {
   const [visible, setVisible] = useState(false)
   const [fadingOut, setFadingOut] = useState(false)
-  const [fadeDuration, setFadeDuration] = useState(POWER_ON_FADE_DURATION_MS)
+  const fadeDuration = POWER_ON_FADE_DURATION_MS
   const [animationSettled, setAnimationSettled] = useState(media.animation === null)
   const [animationAvailable, setAnimationAvailable] = useState(media.animation !== null)
   const [logoSettled, setLogoSettled] = useState(media.logo === null)
@@ -147,7 +145,6 @@ export function PowerOnScreen({ media, onDismiss, ready }: PowerOnScreenProps) {
   const videoRef = useRef<HTMLVideoElement>(null)
   const startedAt = useRef<number | null>(null)
   const fadeOutTimer = useRef<number | null>(null)
-  const dismissTimer = useRef<number | null>(null)
   const playbackStarted = useRef(false)
   const fadingOutRef = useRef(false)
   const dismissedRef = useRef(false)
@@ -156,41 +153,28 @@ export function PowerOnScreen({ media, onDismiss, ready }: PowerOnScreenProps) {
   useEffect(() => {
     startedAt.current = performance.now()
     const frame = window.requestAnimationFrame(() => setVisible(true))
-    const beginFadeOut = () => {
-      if (fadingOutRef.current) return
-      fadingOutRef.current = true
-      const elapsed = startedAt.current === null ? 0 : performance.now() - startedAt.current
-      setFadeDuration(
-        Math.max(0, Math.min(POWER_ON_FADE_DURATION_MS, POWER_ON_MAX_DURATION_MS - elapsed)),
-      )
-      videoRef.current?.pause()
-      setFadingOut(true)
-    }
-    const dismiss = () => {
-      if (dismissedRef.current) return
-      dismissedRef.current = true
-      onDismiss()
-    }
-    fadeOutTimer.current = window.setTimeout(beginFadeOut, POWER_ON_FADE_OUT_AT_MS)
-    dismissTimer.current = window.setTimeout(dismiss, POWER_ON_HARD_STOP_AT_MS)
     return () => {
       window.cancelAnimationFrame(frame)
       if (fadeOutTimer.current !== null) window.clearTimeout(fadeOutTimer.current)
-      if (dismissTimer.current !== null) window.clearTimeout(dismissTimer.current)
     }
-  }, [onDismiss])
+  }, [])
 
   useEffect(() => {
     if (!ready) return
     if (fadeOutTimer.current !== null) window.clearTimeout(fadeOutTimer.current)
     if (fadingOutRef.current) return
-    fadingOutRef.current = true
+    const beginFadeOut = () => {
+      if (fadingOutRef.current) return
+      fadingOutRef.current = true
+      videoRef.current?.pause()
+      setFadingOut(true)
+    }
     const elapsed = startedAt.current === null ? 0 : performance.now() - startedAt.current
-    setFadeDuration(
-      Math.max(0, Math.min(POWER_ON_FADE_DURATION_MS, POWER_ON_MAX_DURATION_MS - elapsed)),
-    )
-    videoRef.current?.pause()
-    setFadingOut(true)
+    if (elapsed < POWER_ON_MIN_DURATION_MS) {
+      fadeOutTimer.current = window.setTimeout(beginFadeOut, POWER_ON_MIN_DURATION_MS - elapsed)
+      return
+    }
+    beginFadeOut()
   }, [ready])
 
   function failAnimation(
@@ -246,7 +230,6 @@ export function PowerOnScreen({ media, onDismiss, ready }: PowerOnScreenProps) {
     if (event.target === event.currentTarget && event.propertyName === 'opacity' && fadingOut) {
       if (dismissedRef.current) return
       dismissedRef.current = true
-      if (dismissTimer.current !== null) window.clearTimeout(dismissTimer.current)
       onDismiss()
     }
   }
@@ -277,6 +260,7 @@ export function PowerOnScreen({ media, onDismiss, ready }: PowerOnScreenProps) {
           className='power-on-animation'
           src={media.animation.src}
           playsInline
+          loop
           preload='auto'
           style={{ visibility: mediaSettled && animationAvailable ? 'visible' : 'hidden' }}
           onCanPlay={handleVideoCanPlay}

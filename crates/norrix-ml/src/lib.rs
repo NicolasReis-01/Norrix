@@ -1,3 +1,5 @@
+use std::time::Instant;
+
 use anyhow::Context;
 use norrix_llama::llama_backend::LlamaBackend;
 use norrix_runtime::{Feature, Hardware, Runtime};
@@ -46,18 +48,40 @@ static READY: OnceCell<Device> = OnceCell::const_new();
 pub async fn init() -> anyhow::Result<()> {
     READY
         .get_or_try_init(|| async {
+            let discovery_started = Instant::now();
             let runtime = Runtime::discover([Feature::Torch, Feature::Llama, Feature::Diffusion])?;
+            tracing::info!(
+                event = "ml_runtime_phase_finished",
+                phase = "runtime_discovery",
+                duration_ms = discovery_started.elapsed().as_secs_f64() * 1000.0,
+                result = "discovered",
+            );
+            let runtime_started = Instant::now();
             let device = runtime
                 .initialize()
                 .await
                 .context("failed to initialize runtimes")?;
+            tracing::info!(
+                event = "ml_runtime_phase_finished",
+                phase = "runtime_package_activation",
+                duration_ms = runtime_started.elapsed().as_secs_f64() * 1000.0,
+                result = "initialized",
+            );
 
+            let llama_started = Instant::now();
             LLAMA
                 .get_or_try_init(|| async {
                     norrix_llama::send_logs_to_tracing(norrix_llama::LogOptions::default());
                     LlamaBackend::init().context("failed to initialize llama.cpp backend")
                 })
                 .await?;
+            tracing::info!(
+                event = "ml_runtime_phase_finished",
+                phase = "llama_backend",
+                duration_ms = llama_started.elapsed().as_secs_f64() * 1000.0,
+                result = "initialized",
+            );
+            let diffusion_started = Instant::now();
             DIFFUSION
                 .get_or_try_init(|| async {
                     norrix_diffusion::send_logs_to_tracing()
@@ -65,6 +89,12 @@ pub async fn init() -> anyhow::Result<()> {
                     Ok::<(), anyhow::Error>(())
                 })
                 .await?;
+            tracing::info!(
+                event = "ml_runtime_phase_finished",
+                phase = "diffusion_log_bridge",
+                duration_ms = diffusion_started.elapsed().as_secs_f64() * 1000.0,
+                result = "initialized",
+            );
             Ok::<Device, anyhow::Error>(device)
         })
         .await?;

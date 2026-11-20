@@ -38,6 +38,18 @@ const MAX_CACHED_PAGE_MANIFESTS: usize = 24;
 const SAMPLE_ROW_BYTES: u64 = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT as u64;
 static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(1);
 
+fn trace_canvas(event: &str, details: impl std::fmt::Display) {
+    #[cfg(debug_assertions)]
+    web_sys::console::debug_1(&JsValue::from_str(&format!(
+        "[Norrix canvas WASM] timestamp={} event={} {}",
+        js_sys::Date::now(),
+        event,
+        details
+    )));
+    #[cfg(not(debug_assertions))]
+    let _ = (event, details);
+}
+
 thread_local! {
     static DEVICE_TARGETS: RefCell<HashMap<u32, Weak<Shared>>> = RefCell::new(HashMap::new());
 }
@@ -498,6 +510,8 @@ struct CanvasState {
     cached_frames: HashMap<LayerId, PreparedFrame>,
     page_layout: Vec<PageLayout>,
     has_page_layout: bool,
+    pinned_manifests: HashMap<LayerId, usize>,
+    last_layout_rejection: Option<String>,
     staged: Option<StagedFrame>,
     manifests: HashMap<LayerId, PreparedFrameManifest>,
     resources: PreparedResourceStore,
@@ -522,6 +536,8 @@ impl CanvasState {
             cached_frames: HashMap::new(),
             page_layout: Vec::new(),
             has_page_layout: false,
+            pinned_manifests: HashMap::new(),
+            last_layout_rejection: None,
             staged: None,
             manifests: HashMap::new(),
             resources: PreparedResourceStore::default(),
@@ -541,12 +557,14 @@ impl CanvasState {
 
     fn stage_manifest(&mut self, bytes: &[u8]) -> Result<StagedManifestDto, JsValue> {
         let manifest = PreparedFrameManifest::decode(bytes).map_err(js_error)?;
+        let page = manifest.frame.page;
+        let revision = manifest.frame.revision.get();
         let resources = manifest
             .required_resources()
             .iter()
             .map(|resource| resource.id)
             .collect::<HashSet<_>>();
-        let missing = manifest
+        let missing: Vec<String> = manifest
             .missing_resources(&self.resources)
             .into_iter()
             .map(|id| id.to_string())
@@ -563,6 +581,14 @@ impl CanvasState {
             manifest,
             resources,
         });
+        trace_canvas(
+            "frame-stage-created",
+            format!(
+                "page={page} revision={revision} generation={} token={token} missing_resources={}",
+                self.generation,
+                missing.len()
+            ),
+        );
         self.evict_resources();
         Ok(StagedManifestDto { token, missing })
     }
@@ -686,15 +712,94 @@ impl CanvasState {
             .get(&frame.page())
             .is_some_and(|cached| cached.frame.revision > frame.revision())
         {
+            let current_revision = self
+                .manifests
+                .get(&frame.page())
+                .map(|cached| cached.frame.revision.get());
+            trace_canvas(
+                "frame-cache-rejected",
+                format!(
+                    "page={} revision={} generation={} token={} result=stale_revision current_revision={current_revision:?}",
+                    frame.page(),
+                    frame.revision().get(),
+                    self.generation,
+                    token
+                ),
+            );
             self.staged = None;
             self.evict_resources();
             return Ok(false);
         }
         self.manifests.insert(frame.page(), manifest);
         self.staged = None;
+        trace_canvas(
+            "frame-cached",
+            format!(
+                "page={} revision={} generation={} token={token} result=cached",
+                frame.page(),
+                frame.revision().get(),
+                self.generation
+            ),
+        );
         self.evict_manifests();
         self.evict_resources();
         Ok(true)
+    }
+
+    fn pin_page_manifests(&mut self, pages: Vec<String>) -> Result<(), JsValue> {
+        let pages = pages
+            .iter()
+            .map(|page| parse_layer_id(page))
+            .collect::<Result<HashSet<_>, _>>()?;
+        if pages.iter().any(|page| {
+            self.pinned_manifests
+                .get(page)
+                .is_some_and(|count| *count == usize::MAX)
+        }) {
+            return Err(js_message("page manifest pin count overflow"));
+        }
+        for page in &pages {
+            let count = self.pinned_manifests.entry(*page).or_default();
+            *count += 1;
+        }
+        trace_canvas(
+            "page-manifests-pinned",
+            format!(
+                "generation={} pages={pages:?} result=pinned",
+                self.generation
+            ),
+        );
+        Ok(())
+    }
+
+    fn unpin_page_manifests(&mut self, pages: Vec<String>) -> Result<(), JsValue> {
+        let pages = pages
+            .iter()
+            .map(|page| parse_layer_id(page))
+            .collect::<Result<HashSet<_>, _>>()?;
+        for page in &pages {
+            if let Some(count) = self.pinned_manifests.get_mut(page) {
+                *count -= 1;
+                if *count == 0 {
+                    self.pinned_manifests.remove(page);
+                }
+            }
+        }
+        trace_canvas(
+            "page-manifests-unpinned",
+            format!(
+                "generation={} pages={pages:?} result=unpinned",
+                self.generation
+            ),
+        );
+        self.evict_manifests();
+        Ok(())
+    }
+
+    fn reject_layout(&mut self, reason: String) -> bool {
+        trace_canvas("layout-validation-rejected", &reason);
+        self.last_layout_rejection = Some(reason);
+        false
     }
 
     fn activate_manifest(
@@ -800,6 +905,19 @@ impl CanvasState {
     }
 
     fn clear(&mut self) {
+        trace_canvas(
+            "frame-clear-started",
+            format!(
+                "generation={} active_page={:?} active_revision={:?} layouts={:?}",
+                self.generation,
+                self.frame.as_ref().map(|frame| frame.page()),
+                self.frame.as_ref().map(|frame| frame.revision().get()),
+                self.page_layout
+                    .iter()
+                    .map(|layout| (layout.page, layout.revision))
+                    .collect::<Vec<_>>(),
+            ),
+        );
         self.gpu
             .cancel_sample("color sample was cancelled by clear");
         self.frame = None;
@@ -808,15 +926,48 @@ impl CanvasState {
         self.has_page_layout = false;
         self.staged = None;
         self.manifests.clear();
+        self.pinned_manifests.clear();
+        self.last_layout_rejection = None;
         self.active_resources.clear();
         self.evict_resources();
         self.opacity.clear();
         self.transform = None;
         self.stroke = None;
         self.dirty = true;
+        trace_canvas(
+            "frame-clear-finished",
+            format!("generation={} result=cleared", self.generation),
+        );
     }
 
     fn set_page_layout(&mut self, layouts: Vec<PageLayoutDto>) -> Result<bool, JsValue> {
+        self.last_layout_rejection = None;
+        if layouts.is_empty() {
+            let reason = format!(
+                "generation={} result=empty_layout current_layout_retained=true",
+                self.generation
+            );
+            return Ok(self.reject_layout(reason));
+        }
+        trace_canvas(
+            "layout-validation-started",
+            format!(
+                "generation={} layouts={:?}",
+                self.generation,
+                layouts
+                    .iter()
+                    .map(|layout| (
+                        layout.page.as_str(),
+                        layout.revision,
+                        layout
+                            .ghost_pages
+                            .iter()
+                            .map(|ghost| ghost.page.as_str())
+                            .collect::<Vec<_>>()
+                    ))
+                    .collect::<Vec<_>>()
+            ),
+        );
         let mut seen = HashSet::with_capacity(layouts.len());
         let mut page_layout = Vec::with_capacity(layouts.len());
         let mut cached_frames = HashMap::with_capacity(layouts.len());
@@ -829,12 +980,21 @@ impl CanvasState {
                 return Err(js_message("page layout repeats a page"));
             }
             let Some(manifest) = self.manifests.get(&page) else {
-                return Ok(false);
+                let reason = format!(
+                    "page={page} revision={} generation={} result=missing_manifest current_layout_retained=true",
+                    layout.revision, self.generation
+                );
+                return Ok(self.reject_layout(reason));
             };
-            if manifest.frame.revision.get() != layout.revision
-                || !manifest.missing_resources(&self.resources).is_empty()
-            {
-                return Ok(false);
+            let missing_resources = manifest.missing_resources(&self.resources).len();
+            if manifest.frame.revision.get() != layout.revision || missing_resources > 0 {
+                let reason = format!(
+                    "page={page} requested_revision={} manifest_revision={} missing_resources={missing_resources} generation={} result=frame_mismatch current_layout_retained=true",
+                    layout.revision,
+                    manifest.frame.revision.get(),
+                    self.generation
+                );
+                return Ok(self.reject_layout(reason));
             }
             let frame = match self
                 .cached_frames
@@ -867,10 +1027,21 @@ impl CanvasState {
                             continue;
                         }
                         let Some(ghost_manifest) = self.manifests.get(&ghost_page) else {
-                            return Ok(false);
+                            let reason = format!(
+                                    "page={page} ghost_page={ghost_page} generation={} result=missing_ghost_manifest current_layout_retained=true",
+                                    self.generation
+                                );
+                            return Ok(self.reject_layout(reason));
                         };
-                        if !ghost_manifest.missing_resources(&self.resources).is_empty() {
-                            return Ok(false);
+                        let missing_resources =
+                            ghost_manifest.missing_resources(&self.resources).len();
+                        if missing_resources > 0 {
+                            let reason = format!(
+                                    "page={page} ghost_page={ghost_page} ghost_revision={} missing_resources={missing_resources} generation={} result=ghost_resources_missing current_layout_retained=true",
+                                    ghost_manifest.frame.revision.get(),
+                                    self.generation
+                                );
+                            return Ok(self.reject_layout(reason));
                         }
                         if !cached_frames.contains_key(&ghost_page) {
                             let ghost_revision = ghost_manifest.frame.revision.get();
@@ -925,6 +1096,17 @@ impl CanvasState {
         self.evict_manifests();
         self.dirty = true;
         self.evict_resources();
+        trace_canvas(
+            "layout-state-replaced",
+            format!(
+                "generation={} layouts={:?} result=accepted dirty=true",
+                self.generation,
+                self.page_layout
+                    .iter()
+                    .map(|layout| (layout.page, layout.revision))
+                    .collect::<Vec<_>>()
+            ),
+        );
         Ok(true)
     }
 
@@ -965,6 +1147,7 @@ impl CanvasState {
         protected.extend(self.frame.as_ref().map(PreparedFrame::page));
         protected.extend(self.transform.as_ref().map(|edit| edit.page));
         protected.extend(self.stroke.as_ref().map(|edit| edit.page));
+        protected.extend(self.pinned_manifests.keys().copied());
         while self.manifests.len() > MAX_CACHED_PAGE_MANIFESTS {
             let candidate = self
                 .manifests
@@ -976,6 +1159,14 @@ impl CanvasState {
             };
             self.manifests.remove(&candidate);
             self.cached_frames.remove(&candidate);
+            trace_canvas(
+                "page-manifest-evicted",
+                format!(
+                    "page={candidate} generation={} result=evicted remaining={}",
+                    self.generation,
+                    self.manifests.len()
+                ),
+            );
         }
     }
 
@@ -983,18 +1174,48 @@ impl CanvasState {
         self.gpu.poll_sample();
         if self.dirty {
             let composition = self.composition();
+            let pages = self
+                .page_layout
+                .iter()
+                .map(|layout| (layout.page, layout.revision))
+                .collect::<Vec<_>>();
+            trace_canvas(
+                "composition-render-started",
+                format!(
+                    "generation={} pages={pages:?} command_count={} result=started",
+                    self.generation,
+                    composition.commands.len()
+                ),
+            );
             if let Err(error) = self.gpu.render(
                 &composition.commands,
                 composition.erase_mask.as_ref(),
                 self.workspace_color,
                 composition.clip,
             ) {
+                trace_canvas(
+                    "composition-render-failed",
+                    format!(
+                        "generation={} pages={pages:?} command_count={} reason={}",
+                        self.generation,
+                        composition.commands.len(),
+                        js_value_message(&error)
+                    ),
+                );
                 return Err(error);
             }
             if !self.size.is_empty() {
                 self.generation = self.generation.wrapping_add(1).max(1);
             }
             self.dirty = false;
+            trace_canvas(
+                "composition-render-finished",
+                format!(
+                    "generation={} pages={pages:?} command_count={} result=rendered",
+                    self.generation,
+                    composition.commands.len()
+                ),
+            );
         }
         Ok((self.generation, self.gpu.sample.is_some()))
     }
@@ -1234,6 +1455,17 @@ impl BrowserGpu {
             return;
         }
         if self.config.width != size.width || self.config.height != size.height {
+            trace_canvas(
+                "surface-reconfigured",
+                format!(
+                    "generation={} previous_size={}x{} requested_size={}x{} result=reconfigured",
+                    self.canvas.generation,
+                    self.config.width,
+                    self.config.height,
+                    size.width,
+                    size.height
+                ),
+            );
             self.config.width = size.width;
             self.config.height = size.height;
             self.surface.configure(&self.device, &self.config);
@@ -1241,6 +1473,20 @@ impl BrowserGpu {
     }
 
     fn present(&mut self) -> Result<(u64, bool), JsValue> {
+        trace_canvas(
+            "presentation-render-requested",
+            format!(
+                "generation={} pages={:?} surface_size={}x{}",
+                self.canvas.generation,
+                self.canvas
+                    .page_layout
+                    .iter()
+                    .map(|layout| (layout.page, layout.revision))
+                    .collect::<Vec<_>>(),
+                self.surface_size.width,
+                self.surface_size.height
+            ),
+        );
         let (generation, needs_redraw) = match self.canvas.render() {
             Ok(state) => state,
             Err(error) => {
@@ -1254,14 +1500,28 @@ impl BrowserGpu {
             wgpu::CurrentSurfaceTexture::Success(texture) => (texture, false),
             wgpu::CurrentSurfaceTexture::Suboptimal(texture) => (texture, true),
             wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                trace_canvas(
+                    "surface-presentation-skipped",
+                    format!("generation={generation} result=skipped reason=timeout_or_occluded"),
+                );
                 return Ok((generation, true));
             }
             wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
+                trace_canvas(
+                    "surface-presentation-skipped",
+                    format!(
+                        "generation={generation} result=skipped reason=lost_or_outdated_reconfigured"
+                    ),
+                );
                 return Ok((generation, true));
             }
             wgpu::CurrentSurfaceTexture::Validation => {
                 let error = js_message("browser canvas surface validation failed");
+                trace_canvas(
+                    "surface-presentation-failed",
+                    format!("generation={generation} result=failed reason=validation"),
+                );
                 return Err(error);
             }
         };
@@ -1278,6 +1538,17 @@ impl BrowserGpu {
             .copy(&self.device, &mut encoder, source, &target);
         self.queue.submit([encoder.finish()]);
         surface_texture.present();
+        trace_canvas(
+            "surface-frame-presented",
+            format!(
+                "generation={generation} pages={:?} result=present_called",
+                self.canvas
+                    .page_layout
+                    .iter()
+                    .map(|layout| (layout.page, layout.revision))
+                    .collect::<Vec<_>>()
+            ),
+        );
         if suboptimal {
             self.surface.configure(&self.device, &self.config);
         }
@@ -1489,14 +1760,41 @@ impl WebCanvas {
         let size_changed = browser.canvas.size != size;
         let background_changed = browser.canvas.workspace_color != background;
         if size_changed {
+            trace_canvas(
+                "render-target-resize-started",
+                format!(
+                    "generation={} previous_size={}x{} requested_size={}x{} result=started",
+                    browser.canvas.generation,
+                    browser.canvas.size.width,
+                    browser.canvas.size.height,
+                    size.width,
+                    size.height
+                ),
+            );
             browser.element.set_width(size.width);
             browser.element.set_height(size.height);
             browser.configure_surface(size);
             browser.canvas.size = size;
             browser.canvas.gpu.resize(size);
+            trace_canvas(
+                "render-target-resized",
+                format!(
+                    "generation={} size={}x{} result=target_recreated",
+                    browser.canvas.generation, size.width, size.height
+                ),
+            );
         }
         browser.canvas.workspace_color = background;
         browser.canvas.dirty |= size_changed || background_changed;
+        if background_changed {
+            trace_canvas(
+                "workspace-background-updated",
+                format!(
+                    "generation={} result=updated size_changed={size_changed}",
+                    browser.canvas.generation
+                ),
+            );
+        }
         drop(browser);
         self.request_render()
     }
@@ -1600,12 +1898,57 @@ impl WebCanvas {
         self.browser_mut()?.canvas.cache_frame(token)
     }
 
+    #[wasm_bindgen(js_name = pinPageManifests)]
+    pub fn pin_page_manifests(&self, pages: JsValue) -> Result<(), JsValue> {
+        let pages: Vec<String> = serde_wasm_bindgen::from_value(pages).map_err(js_error)?;
+        self.browser_mut()?.canvas.pin_page_manifests(pages)
+    }
+
+    #[wasm_bindgen(js_name = unpinPageManifests)]
+    pub fn unpin_page_manifests(&self, pages: JsValue) -> Result<(), JsValue> {
+        let pages: Vec<String> = serde_wasm_bindgen::from_value(pages).map_err(js_error)?;
+        self.browser_mut()?.canvas.unpin_page_manifests(pages)
+    }
+
+    #[wasm_bindgen(js_name = getLastLayoutRejection)]
+    pub fn get_last_layout_rejection(&self) -> Result<Option<String>, JsValue> {
+        Ok(self.browser_mut()?.canvas.last_layout_rejection.clone())
+    }
+
     #[wasm_bindgen(js_name = setPageLayout)]
     pub fn set_page_layout(&self, layouts: JsValue) -> Result<bool, JsValue> {
         let layouts: Vec<PageLayoutDto> =
             serde_wasm_bindgen::from_value(layouts).map_err(js_error)?;
+        let requested = layouts
+            .iter()
+            .map(|layout| {
+                (
+                    layout.page.clone(),
+                    layout.revision,
+                    layout
+                        .ghost_pages
+                        .iter()
+                        .map(|ghost| ghost.page.clone())
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect::<Vec<_>>();
         let mut browser = self.browser_mut()?;
         let accepted = browser.canvas.set_page_layout(layouts)?;
+        trace_canvas(
+            if accepted {
+                "layout-application-accepted"
+            } else {
+                "layout-application-rejected"
+            },
+            format!(
+                "generation={} pages={requested:?} result={} previous_composition_retained={} rejection={:?}",
+                browser.canvas.generation,
+                if accepted { "accepted" } else { "rejected" },
+                !accepted,
+                browser.canvas.last_layout_rejection
+            ),
+        );
         drop(browser);
         if accepted {
             self.shared.request_render()?;

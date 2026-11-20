@@ -27,6 +27,7 @@ web-sys = { workspace = true, features = [
     "Blob",
     "BlobPropertyBag",
     "ColorSpaceConversion",
+    "console",
     "HtmlCanvasElement",
     "ImageBitmap",
     "ImageBitmapOptions",

@@ -1,0 +1,78 @@
+<!-- Original benchmark artwork created for Norrix; no external assets are used. -->
+<svg xmlns="http://www.w3.org/2000/svg" width="770" height="1080" viewBox="0 0 770 1080">
+  <defs>
+    <linearGradient id="sky" x2="0" y2="1">
+      <stop stop-color="#b9e8ff"/>
+      <stop offset="1" stop-color="#fff5d8"/>
+    </linearGradient>
+    <pattern id="dots" width="12" height="12" patternUnits="userSpaceOnUse">
+      <circle cx="3" cy="3" r="1.5" fill="#e69ab0" opacity=".55"/>
+    </pattern>
+    <style>
+      .panel { stroke: #20232a; stroke-width: 7; }
+      .balloon { fill: #fff; stroke: #20232a; stroke-width: 4; }
+      .action { font: 900 48px Arial, sans-serif; fill: #3156a8; stroke: #fff; stroke-width: 2; paint-order: stroke; }
+    </style>
+  </defs>
+  <rect width="770" height="1080" fill="#f3f0e9"/>
+
+  <g class="panel">
+    <rect x="22" y="22" width="726" height="282" rx="3" fill="url(#sky)"/>
+    <path d="M25 242 125 152 215 224 326 105 424 240 527 155 745 262v39H25Z" fill="#95c98b"/>
+    <path d="M31 272h709v28H31z" fill="#6b9b67"/>
+    <rect x="454" y="44" width="265" height="100" rx="12" fill="#fff" opacity=".84"/>
+    <rect x="480" y="68" width="172" height="12" rx="6" fill="#38404b"/>
+    <rect x="480" y="94" width="116" height="8" rx="4" fill="#66717b"/>
+    <circle cx="160" cy="178" r="38" fill="#f5c5a1" stroke="#20232a" stroke-width="4"/>
+    <path d="M124 170q4-54 42-47 34 3 35 44l-20-16-18 17-20-12Z" fill="#39415c" stroke="#20232a" stroke-width="4"/>
+    <path d="M112 218q48-35 96 0l17 82H96Z" fill="#df7180" stroke="#20232a" stroke-width="4"/>
+    <circle cx="147" cy="179" r="4" fill="#20232a"/><circle cx="174" cy="179" r="4" fill="#20232a"/>
+    <path d="M150 196q12 10 23 0" fill="none" stroke="#a64d51" stroke-width="3"/>
+    <path class="balloon" d="M290 47q91-26 113 31 16 47-31 70l-27 30 5-34q-62-4-67-49-5-34 7-48Z"/>
+    <rect x="315" y="83" width="73" height="8" rx="4" fill="#38404b"/>
+    <rect x="327" y="104" width="48" height="7" rx="3.5" fill="#38404b"/>
+  </g>
+
+  <g class="panel">
+    <rect x="22" y="326" width="348" height="318" fill="#ffe1d2"/>
+    <rect x="378" y="326" width="370" height="318" fill="url(#dots)"/>
+    <path d="M22 568q95-65 173-1t175-4v77H22Z" fill="#e8a9a0"/>
+    <path d="M380 571q86-74 176-8t192-3v77H380Z" fill="#f0c37c"/>
+    <circle cx="113" cy="487" r="40" fill="#f0bd9b" stroke="#20232a" stroke-width="4"/>
+    <path d="M72 480q-2-58 45-59 46 2 44 55l-21-19-20 13-27-9Z" fill="#6d4e42" stroke="#20232a" stroke-width="4"/>
+    <path d="M63 534q50-37 100 0l19 105H44Z" fill="#6e8fc9" stroke="#20232a" stroke-width="4"/>
+    <circle cx="100" cy="489" r="4"/><circle cx="126" cy="489" r="4"/>
+    <circle cx="281" cy="513" r="34" fill="#e9b38e" stroke="#20232a" stroke-width="4"/>
+    <path d="M245 509q7-48 38-42 38 1 36 41l-20-13-15 12-18-9Z" fill="#b46d53" stroke="#20232a" stroke-width="4"/>
+    <path d="M237 553q43-28 88 0l20 86h-128Z" fill="#68a78d" stroke="#20232a" stroke-width="4"/>
+    <path class="balloon" d="M138 351q92-22 115 30 20 48-38 69l-18 23-2-27q-70 3-73-48-2-33 16-47Z"/>
+    <rect x="151" y="383" width="70" height="8" rx="4" fill="#38404b"/>
+    <rect x="158" y="403" width="58" height="8" rx="4" fill="#38404b"/>
+    <text class="action" x="410" y="406" transform="rotate(-10 410 406)">TAP!</text>
+    <path d="M450 430l-32 75 82-45-21 75 68-70" fill="none" stroke="#e34f65" stroke-width="8" stroke-linecap="round"/>
+    <path class="balloon" d="M520 522q93-28 128 22 30 45-20 73l-19 20 1-27q-69 7-91-30-18-31 1-58Z"/>
+    <rect x="545" y="555" width="68" height="8" rx="4" fill="#38404b"/>
+    <rect x="548" y="575" width="64" height="8" rx="4" fill="#38404b"/>
+  </g>
+
+  <g class="panel">
+    <rect x="22" y="666" width="726" height="390" fill="#d9e7f2"/>
+    <path d="M25 960h718v93H25Z" fill="#788da5"/>
+    <path d="m25 842 150-78 133 84 127-111 153 89 161-48v174H25Z" fill="#a9bac5"/>
+    <path d="M50 952 186 790l74 162M286 952l133-173 130 173M532 952l114-145 90 145" fill="none" stroke="#667b8a" stroke-width="10"/>
+    <circle cx="287" cy="854" r="43" fill="#f0bd9b" stroke="#20232a" stroke-width="4"/>
+    <path d="M242 850q3-57 48-52 45 4 43 53l-24-16-19 17-27-11Z" fill="#39415c" stroke="#20232a" stroke-width="4"/>
+    <path d="M225 912q61-42 123 0l29 142H198Z" fill="#df7180" stroke="#20232a" stroke-width="4"/>
+    <circle cx="273" cy="856" r="4"/><circle cx="301" cy="856" r="4"/>
+    <path d="M272 874q15 9 29-1" fill="none" stroke="#a64d51" stroke-width="3"/>
+    <path class="balloon" d="M42 700q94-27 125 19 29 45-16 75l-17 22 1-28q-73 7-94-31-18-31 1-57Z"/>
+    <rect x="64" y="733" width="69" height="8" rx="4" fill="#38404b"/>
+    <rect x="70" y="753" width="55" height="8" rx="4" fill="#38404b"/>
+    <path class="balloon" d="M463 699q112-30 148 28 27 44-27 74l-18 24 1-29q-78 8-104-34-18-31 0-63Z"/>
+    <rect x="497" y="737" width="72" height="8" rx="4" fill="#38404b"/>
+    <rect x="502" y="757" width="63" height="8" rx="4" fill="#38404b"/>
+    <text class="action" x="91" y="1005" transform="rotate(-8 91 1005)">WHOOSH</text>
+    <path d="M392 903l36-27m-23 57 57-10m-48 43 39 13" stroke="#fff" stroke-width="9" stroke-linecap="round"/>
+    <circle cx="412" cy="844" r="8" fill="#fff"/><circle cx="443" cy="821" r="5" fill="#fff"/>
+  </g>
+</svg>

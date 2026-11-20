@@ -9,7 +9,7 @@ Use the same Windows account for both PowerShell windows.
 1. Open **PowerShell as Administrator** and start the Kernel-Process ETW session:
 
    ```powershell
-   $root = 'C:\Users\ZEF_L\Downloads\koharu-0.83.5 (1)\koharu-0.83.5'
+   $root = 'C:\path\to\Norrix'
    & "$root\scripts\diagnostics\Start-NorrixEtw.ps1"
    ```
 
@@ -18,7 +18,7 @@ Use the same Windows account for both PowerShell windows.
 2. Open a **normal, non-elevated PowerShell** in the same account and run the capture script once, using that exact directory:
 
    ```powershell
-   $root = 'C:\Users\ZEF_L\Downloads\koharu-0.83.5 (1)\koharu-0.83.5'
+   $root = 'C:\path\to\Norrix'
    & "$root\scripts\diagnostics\Capture-NorrixDev.ps1" -OutputDirectory 'PASTE_OUTPUT_DIRECTORY_HERE'
    ```
 

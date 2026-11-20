@@ -47,5 +47,15 @@ pub(crate) fn http() -> Result<Client> {
         .tcp_keepalive(Duration::from_secs(60))
         .build()
         .context("failed to build HTTP client")?;
+    tracing::info!(
+        event = "shared_http_client_policy",
+        connect_timeout_ms = config.connect_timeout.max(1).saturating_mul(1000),
+        response_read_timeout_configured = false,
+        total_request_timeout_configured = false,
+        download_read_timeout_ms = config.read_timeout.max(1).saturating_mul(1000),
+        automatic_retries_configured = false,
+        connection_pooling_enabled = true,
+        result = "configured",
+    );
     Ok(HTTP_CLIENT.get_or_init(|| client).clone())
 }

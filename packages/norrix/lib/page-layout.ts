@@ -5,6 +5,18 @@ export function infiniteScrollTranslation(scrollTop: number, dpr: number): [numb
   return [0, -scrollTop * dpr]
 }
 
+export function infiniteScrollTopForZoom(
+  scrollTop: number,
+  viewportHeight: number,
+  previousZoom: number,
+  nextZoom: number,
+  dpr: number,
+): number {
+  if (previousZoom <= 0 || nextZoom <= 0 || dpr <= 0) return Math.max(0, scrollTop)
+  const documentY = ((scrollTop + viewportHeight * 0.5) * dpr) / previousZoom
+  return Math.max(0, (documentY * nextZoom) / dpr - viewportHeight * 0.5)
+}
+
 export function adjacentPageIds(pages: PageSummary[], id: string): string[] {
   const index = pages.findIndex((page) => page.id === id)
   if (index < 0) return []
@@ -55,6 +67,27 @@ export function residentPageIds(
   const start = Math.max(0, first - 1)
   const end = Math.min(pages.length, Math.max(first + 3, last + 2))
   return pages.slice(start, end).map((page) => page.id)
+}
+
+export function visiblePageIds(
+  pages: PageSummary[],
+  scrollTop: number,
+  viewportHeight: number,
+  zoom: number,
+  dpr: number,
+): string[] {
+  if (!pages.length || zoom <= 0 || dpr <= 0) return []
+  const scale = zoom / dpr
+  const top = Math.max(0, scrollTop)
+  const bottom = top + Math.max(0, viewportHeight)
+  let pageTop = 0
+  const visible: string[] = []
+  for (const page of pages) {
+    const pageBottom = pageTop + page.size.height * scale
+    if (pageBottom > top && pageTop < bottom) visible.push(page.id)
+    pageTop = pageBottom
+  }
+  return visible
 }
 
 export function pageIndexAtScroll(

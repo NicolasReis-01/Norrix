@@ -14,7 +14,8 @@ import {
 import { useTranslation } from 'react-i18next'
 
 import { ColorWell } from '@/components/controls/ColorWell'
-import { useWorkspacePage } from '@/lib/queries'
+import { call } from '@/lib/backend'
+import { pageKey, pagesKey, projectKey, refresh, usePages, useWorkspacePage } from '@/lib/queries'
 import {
   isBrushTool,
   MAX_BRUSH_DIAMETER,
@@ -22,6 +23,7 @@ import {
   useNorrixStore,
   type CanvasTool,
 } from '@/lib/store'
+import { commands } from '@norrix/bridge/protocol'
 import { Button } from '@norrix/ui/components/button'
 import {
   NumberField,
@@ -57,10 +59,20 @@ export function ToolBar() {
   const setTool = useNorrixStore((state) => state.setTool)
   const setBrush = useNorrixStore((state) => state.setBrush)
   const shortcuts = useNorrixStore((state) => state.shortcuts)
+  const selectedPages = useNorrixStore((state) => state.selectedPages)
+  const selectedLayers = useNorrixStore((state) => state.selectedLayers)
+  const pages = usePages().data ?? []
   const hasBrush = isBrushTool(active)
+  const selectedText = page?.layers?.find(
+    (layer) => layer.type === 'text' && selectedLayers.includes(layer.id),
+  )
+  const pageTargets = selectedPages.length > 1 ? selectedPages : page ? [page.id] : []
+  const targetPages = pages.filter((candidate) => pageTargets.includes(candidate.id))
+  const pageSelectionIsAmbiguous = selectedLayers.length > 0
+  const canEditTranslation = selectedLayers.length === 1 && selectedText !== undefined
 
   return (
-    <aside className='absolute top-3 left-3 z-20 flex w-11 flex-col rounded-2xl border border-border bg-[var(--surface-floating)] p-1 shadow-[var(--shadow-toolrail)]'>
+    <aside className='absolute top-3 left-3 z-20 flex w-12 flex-col rounded-2xl border border-border bg-[var(--surface-floating)] p-1 shadow-[var(--shadow-toolrail)]'>
       <div className='flex flex-col items-center py-0.5'>
         {tools.map(([tool, Icon], index) => (
           <div key={tool} className='contents'>
@@ -89,6 +101,51 @@ export function ToolBar() {
             </Tooltip>
           </div>
         ))}
+      </div>
+
+      <div className='flex flex-col items-center gap-0.5 border-t border-border/80 py-1.5'>
+        {(
+          [
+            ['detection', 'DTC', 'detection_complete'],
+            ['ocr', 'OCR', 'ocr_complete'],
+            ['translation', 'TRD', 'translation_complete'],
+            ['inpainting', 'PRE', 'inpainting_complete'],
+          ] as const
+        ).map(([kind, label, field]) => {
+          const isTranslation = kind === 'translation'
+          const disabled = isTranslation
+            ? !canEditTranslation
+            : !targetPages.length || pageSelectionIsAmbiguous
+          const isComplete = isTranslation
+            ? Boolean(selectedText?.type === 'text' && selectedText.content.translation_complete)
+            : targetPages.length > 0 && targetPages.every((candidate) => candidate[field])
+          const title = isTranslation ? t('progress.textMarker') : t('progress.pageMarker')
+          return (
+            <Button
+              key={kind}
+              type='button'
+              variant='ghost'
+              size='icon'
+              aria-label={`${label} — ${title}`}
+              aria-pressed={isComplete}
+              disabled={disabled}
+              data-complete={isComplete}
+              className='h-6 w-9 rounded-lg px-1 text-[9px] font-semibold tracking-tight text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground disabled:opacity-30 data-[complete=true]:bg-primary/10 data-[complete=true]:text-primary'
+              onClick={() => {
+                if (disabled) return
+                const textLayer = isTranslation ? (selectedText?.id ?? null) : null
+                const pageIds = isTranslation ? [] : targetPages.map((candidate) => candidate.id)
+                void call(commands.setProgressMarkers, pageIds, textLayer, kind, !isComplete)
+                  .then(() => refresh(projectKey, pagesKey, pageKey))
+                  .catch((error: unknown) => {
+                    console.error('Failed to update pipeline progress marker', error)
+                  })
+              }}
+            >
+              {label}
+            </Button>
+          )
+        })}
       </div>
 
       {hasBrush && (

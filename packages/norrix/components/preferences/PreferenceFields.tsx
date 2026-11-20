@@ -54,15 +54,17 @@ export function PreferenceRow({
   description,
   children,
   align = 'center',
+  fullWidth = false,
 }: {
   title: string
   description?: string
   children: React.ReactNode
   align?: 'center' | 'start'
+  fullWidth?: boolean
 }) {
   return (
     <div
-      className={`grid grid-cols-[minmax(150px,0.9fr)_minmax(220px,1.1fr)] gap-6 py-3.5 ${align === 'start' ? 'items-start' : 'items-center'}`}
+      className={`grid ${fullWidth ? 'grid-cols-1 gap-3' : 'grid-cols-[minmax(150px,0.9fr)_minmax(220px,1.1fr)] gap-6'} py-3.5 ${align === 'start' ? 'items-start' : 'items-center'}`}
     >
       <div>
         <p className='text-[12px] font-medium'>{title}</p>

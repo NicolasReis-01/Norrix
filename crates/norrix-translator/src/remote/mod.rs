@@ -21,7 +21,10 @@ pub use claude::ClaudeConfig;
 pub use deepl::DeepLConfig;
 pub use deepseek::DeepSeekConfig;
 pub use gemini::GeminiConfig;
-pub use gemini::{GeminiApiKeyInfo, GeminiApiKeyStatus, GeminiApiKeyTestResult};
+pub use gemini::{
+    GeminiApiKeyInfo, GeminiApiKeyManualStatus, GeminiApiKeyStatus, GeminiApiKeyTestResult,
+    GeminiKeyFailure, GeminiRotationEvent,
+};
 pub use google_cloud::GoogleCloudConfig;
 pub use grok::GrokConfig;
 pub use lm_studio::LmStudioConfig;
@@ -34,14 +37,14 @@ pub(crate) fn set_gemini_api_keys(keys: &[norrix_secrets::SecretString]) -> anyh
     gemini::set_api_keys(keys)
 }
 
-pub(crate) fn set_gemini_primary_api_key(key: norrix_secrets::SecretString) -> anyhow::Result<()> {
-    gemini::set_primary_api_key(key)
+pub(crate) fn add_gemini_api_key(key: norrix_secrets::SecretString) -> anyhow::Result<()> {
+    gemini::add_api_key(key)
 }
 
-pub(crate) fn set_gemini_primary_api_key_with_info(
+pub(crate) fn add_gemini_api_key_with_info(
     key: norrix_secrets::SecretString,
 ) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
-    gemini::set_primary_api_key_with_info(key)
+    gemini::add_api_key_with_info(key)
 }
 
 pub(crate) fn clear_gemini_api_keys() -> anyhow::Result<()> {
@@ -60,26 +63,27 @@ pub(crate) fn gemini_api_key_info() -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
     gemini::api_key_info()
 }
 
-pub(crate) fn add_gemini_secondary_api_key(
-    key: norrix_secrets::SecretString,
-) -> anyhow::Result<()> {
-    gemini::add_secondary_api_key(key)
-}
-
-pub(crate) fn add_gemini_secondary_api_key_with_info(
-    key: norrix_secrets::SecretString,
-) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
-    gemini::add_secondary_api_key_with_info(key)
-}
-
-pub(crate) fn remove_gemini_secondary_api_key(id: &str) -> anyhow::Result<()> {
-    gemini::remove_secondary_api_key(id)
-}
-
-pub(crate) fn remove_gemini_secondary_api_key_with_info(
+pub(crate) fn set_gemini_api_key_manual_status(
     id: &str,
+    status: Option<GeminiApiKeyManualStatus>,
 ) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
-    gemini::remove_secondary_api_key_with_info(id)
+    gemini::set_api_key_manual_status(id, status)
+}
+
+pub(crate) fn subscribe_gemini_rotation_events()
+-> tokio::sync::broadcast::Receiver<GeminiRotationEvent> {
+    gemini::subscribe_rotation_events()
+}
+
+pub(crate) fn replace_gemini_api_key_with_info(
+    id: &str,
+    key: norrix_secrets::SecretString,
+) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
+    gemini::replace_api_key_with_info(id, key)
+}
+
+pub(crate) fn remove_gemini_api_key_with_info(id: &str) -> anyhow::Result<Vec<GeminiApiKeyInfo>> {
+    gemini::remove_api_key_with_info(id)
 }
 
 pub(crate) async fn test_gemini_api_key(id: &str) -> anyhow::Result<GeminiApiKeyTestResult> {
@@ -192,6 +196,7 @@ pub(super) async fn send_json<T: DeserializeOwned>(
     let response = request
         .send()
         .await
+        .map_err(|error| error.without_url())
         .with_context(|| format!("{provider} request failed"))?;
     let status = response.status();
     let text = response

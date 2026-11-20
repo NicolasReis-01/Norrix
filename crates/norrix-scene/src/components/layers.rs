@@ -113,7 +113,7 @@ pub enum FontStyle {
     Oblique,
 }
 
-#[revisioned(revision = 2)]
+#[revisioned(revision = 3)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 pub struct Typography {
     pub origin: Origin,
@@ -122,6 +122,8 @@ pub struct Typography {
     pub font_style: Option<FontStyle>,
     pub size: Option<f32>,
     pub auto_fit: bool,
+    #[revision(start = 3)]
+    pub auto_fit_size: Option<f32>,
     pub color: Option<[u8; 4]>,
     pub stroke_color: Option<[u8; 4]>,
     pub stroke_width: Option<f32>,
@@ -147,6 +149,9 @@ impl Component for Typography {
                 .is_some_and(|weight| !(1..=1000).contains(&weight))
             || self
                 .size
+                .is_some_and(|size| !size.is_finite() || size <= 0.0)
+            || self
+                .auto_fit_size
                 .is_some_and(|size| !size.is_finite() || size <= 0.0)
             || (!self.auto_fit && self.size.is_none())
             || self

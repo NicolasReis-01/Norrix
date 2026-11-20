@@ -255,11 +255,45 @@ pub fn run(context: tauri::Context<CefRuntime>) -> Result<()> {
                 event,
                 WindowEvent::CloseRequested { .. } | WindowEvent::Destroyed
             ) {
+                let cancellation_reason = match event {
+                    WindowEvent::CloseRequested { .. } => "window_close_requested",
+                    WindowEvent::Destroyed => "window_destroyed",
+                    _ => unreachable!(),
+                };
                 let processing = window.state::<Processing>();
-                for stop in processing.stops.lock().values() {
-                    stop.stop();
+                let mut stops = processing.stops.lock();
+                tracing::info!(
+                    event = "application_shutdown_requested",
+                    process_state = "shutdown_requested",
+                    shutdown_reason = cancellation_reason,
+                    active_pipeline_jobs = stops.len(),
+                    result = "cancelling_jobs",
+                );
+                tracing::info!(
+                    target: "norrix_metrics",
+                    event = "application_shutdown_requested",
+                    shutdown_reason = cancellation_reason,
+                    active_pipeline_jobs = stops.len(),
+                    result = "cancelling_jobs",
+                );
+                for (job_id, stop) in stops.iter() {
+                    tracing::info!(
+                        event = "pipeline_job_cancellation_requested",
+                        job_id = %job_id,
+                        cancellation_reason,
+                        result = "requested",
+                    );
+                    tracing::info!(
+                        target: "norrix_metrics",
+                        event = "pipeline_job_cancellation_requested",
+                        job_id = %job_id,
+                        cancellation_reason,
+                        result = "requested",
+                    );
+                    stop.stop_with_reason(cancellation_reason);
                 }
-                processing.stops.lock().clear();
+                stops.clear();
+                drop(stops);
                 processing.jobs.lock().clear();
                 window.state::<AgentState>().cancel_all();
             }
@@ -273,5 +307,15 @@ pub fn run(context: tauri::Context<CefRuntime>) -> Result<()> {
             }
         })
         .run(context)?;
+    tracing::info!(
+        event = "application_runtime_exited",
+        process_state = "event_loop_returned",
+        result = "event_loop_returned",
+    );
+    tracing::info!(
+        target: "norrix_metrics",
+        event = "application_runtime_exited",
+        result = "event_loop_returned",
+    );
     Ok(())
 }

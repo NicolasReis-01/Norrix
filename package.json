@@ -5,7 +5,7 @@
   ],
   "scripts": {
     "tauri": "cargo tauri",
-    "postinstall": "cargo install tauri-cli --version =3.0.0-alpha.1 --locked",
+    "setup:tauri-cli": "cargo install tauri-cli --version =3.0.0-alpha.1 --locked",
     "dev": "cargo tauri dev",
     "build": "cargo tauri build --no-bundle",
     "docs": "bun run --filter @norrix/docs dev",
@@ -26,7 +26,16 @@
     "typescript": "^7.0.2"
   },
   "overrides": {
+    "@mintlify/package-builder": {
+      "js-yaml": "4.3.2"
+    },
     "@tauri-apps/api": "3.0.0-alpha.0",
+    "@ts-morph/common": {
+      "minimatch": "11.0.9"
+    },
+    "nodemon": {
+      "minimatch": "11.0.9"
+    },
     "react": "^19.3.0",
     "sharp": "^0.35.4"
   }

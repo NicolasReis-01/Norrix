@@ -78,6 +78,7 @@ beforeEach(() => {
     downloads: {},
     camera: { zoom: 1, translation: [0, 0], fitted: true },
     canvasPage: null,
+    canvasTraceId: '',
     canvasRevision: null,
     canvasGeneration: 0,
     canvasSize: [0, 0],

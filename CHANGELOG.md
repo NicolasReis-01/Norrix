@@ -1,3 +1,9 @@
+# Norrix changelog
+
+The current Norrix version is `0.71.2`. The release entries below are inherited upstream Koharu history, retained for attribution and context. Their version numbers, dates, commit links, and described changes refer to `koharu-rs/koharu`; they are not Norrix releases. This workspace has no independently verifiable Norrix release history.
+
+## Upstream Koharu release history
+
 ## [0.83.5](https://github.com/koharu-rs/koharu/compare/0.83.4..0.83.5) - 2026-09-22
 
 ### 🐛 Bug Fixes

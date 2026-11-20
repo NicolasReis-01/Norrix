@@ -6,8 +6,10 @@
 
 mod analysis;
 mod assets;
+mod font;
 mod groups;
 mod layers;
+mod progress;
 mod provenance;
 mod spatial;
 mod structure;
@@ -18,11 +20,13 @@ pub use analysis::{
 };
 pub(crate) use assets::Assets;
 pub use assets::{Asset, AssetInput, AssetMetadata, AssetRole};
+pub use font::OriginalFontEstimate;
 pub use groups::{Group, TextGroup};
 pub use layers::{
     FontStyle, RasterLayer, RasterLayerKind, TextAlignment, TextLayout, TextLayoutKind, Typography,
     WritingMode,
 };
+pub use progress::{PipelineProgress, ProgressKind, ProgressOrigin, ProgressStatus};
 pub use provenance::{Authored, Generation, Origin};
 pub use spatial::{Geometry, Point, Visibility};
 pub use structure::{EntityOrigin, Page, PageDraft, Project, Relation, RelationKind};

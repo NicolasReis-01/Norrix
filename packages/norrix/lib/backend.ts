@@ -46,11 +46,12 @@ export function savePreferences(
   pipeline: PipelineConfig,
   providers: ProviderPreferences,
   typesetting: TypesettingConfig,
+  view: Preferences['view'],
 ): Promise<Preferences> {
   preferencesWriteGeneration += 1
   const pending = preferencesWriteQueue
     .catch(() => undefined)
-    .then(() => call(commands.savePreferences, pipeline, providers, typesetting))
+    .then(() => call(commands.savePreferences, pipeline, providers, typesetting, view))
   preferencesWriteQueue = pending.then(
     () => undefined,
     () => undefined,

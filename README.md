@@ -1,9 +1,7 @@
 <div align="center">
-<img src="crates/koharu/icons/icon.png" alt="Ícone do Norrix" width="250">
+<img src="crates/norrix/icons/icon.png" alt="Ícone do Norrix" width="250">
 
-  <h1Get-NetTCPConnection -State Listen |
-  Where-Object { $_.LocalPort -in 1420, 1421, 5173, 5174 } |
-  Select-Object LocalAddress, LocalPort, OwningProcess style="font-size: 48px;">Norrix</h1>
+  <h1 style="font-size: 48px;">Norrix</h1>
 
   <p>Tradução de mangás assistida por inteligência artificial, desenvolvida em Rust.</p>
 
@@ -111,7 +109,10 @@ Na raiz do repositório, instale as dependências:
 
 ```bash
 bun install
+bun run setup:tauri-cli
 ```
+
+The Tauri CLI is installed explicitly rather than during dependency installation.
 
 ### Executar em desenvolvimento
 

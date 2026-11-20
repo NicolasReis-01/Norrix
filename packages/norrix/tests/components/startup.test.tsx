@@ -3,14 +3,18 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
 import { PowerOnScreen } from '@/components/app/StartupView'
 import {
-  POWER_ON_FADE_OUT_AT_MS,
   POWER_ON_FADE_DURATION_MS,
-  POWER_ON_HARD_STOP_AT_MS,
-  POWER_ON_MAX_DURATION_MS,
+  POWER_ON_MIN_DURATION_MS,
+  powerOnMedia,
   type PowerOnMedia,
 } from '@/lib/power-on-config'
 
 let animationFrames: FrameRequestCallback[]
+
+const videoMedia: PowerOnMedia = {
+  animation: { kind: 'video', src: '/power-on/animation/power-on.webm' },
+  logo: null,
+}
 
 function flushAnimationFrames() {
   const callbacks = animationFrames
@@ -42,37 +46,28 @@ afterEach(() => {
 })
 
 describe('Power On screen', () => {
-  it('renders only the configured video and logo, and starts the video with its embedded audio', () => {
-    const { container } = powerOn({
-      animation: { kind: 'video', src: '/power-on/animation/power-on.webm' },
-      logo: '/power-on/logo/power-on-logo.png',
-    })
+  it('renders the configured full-screen video without a separate logo', () => {
+    const { container } = powerOn(powerOnMedia)
     flushAnimationFrames()
 
     const video = container.querySelector('video')!
-    const logo = container.querySelector('img')!
     expect(video).toHaveAttribute('src', '/power-on/animation/power-on.webm')
-    expect(logo).toHaveAttribute('src', '/power-on/logo/power-on-logo.png')
+    expect(powerOnMedia.logo).toBeNull()
+    expect(container.querySelector('img')).not.toBeInTheDocument()
     expect(container.querySelector('audio')).not.toBeInTheDocument()
     expect(container).not.toHaveTextContent(/\S/)
 
     fireEvent.canPlay(video)
     expect(video.muted).toBe(false)
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledOnce()
-
-    fireEvent.load(logo)
     expect(video).toHaveStyle({ visibility: 'visible' })
-    expect(logo).toHaveStyle({ visibility: 'visible' })
   })
 
   it('shows the video muted if autoplay with its embedded audio is rejected', async () => {
     vi.spyOn(HTMLMediaElement.prototype, 'play')
       .mockRejectedValueOnce(new Error('autoplay denied'))
       .mockResolvedValueOnce()
-    const { container } = powerOn({
-      animation: { kind: 'video', src: '/power-on/animation/power-on.webm' },
-      logo: '/power-on/logo/power-on-logo.png',
-    })
+    const { container } = powerOn(videoMedia)
     const video = container.querySelector('video')!
 
     fireEvent.canPlay(video)
@@ -80,31 +75,22 @@ describe('Power On screen', () => {
 
     expect(video.muted).toBe(true)
     expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2)
-    fireEvent.load(container.querySelector('img')!)
     expect(video).toHaveStyle({ visibility: 'visible' })
   })
 
-  it('fades out immediately when startup is ready without an artificial minimum duration', () => {
-    const { container, onDismiss, rerender } = powerOn({
-      animation: { kind: 'video', src: '/power-on/animation/power-on.webm' },
-      logo: '/power-on/logo/power-on-logo.png',
-    })
+  it('waits for the configured minimum duration when startup becomes ready', () => {
+    const { container, onDismiss, rerender } = powerOn(videoMedia)
     flushAnimationFrames()
     const screen = container.querySelector('.power-on-screen')!
 
     expect(screen).toHaveAttribute('data-visible', 'true')
     expect(screen).toHaveAttribute('data-fading', 'false')
 
-    rerender(
-      <PowerOnScreen
-        media={{
-          animation: { kind: 'video', src: '/power-on/animation/power-on.webm' },
-          logo: '/power-on/logo/power-on-logo.png',
-        }}
-        onDismiss={onDismiss}
-        ready
-      />,
-    )
+    rerender(<PowerOnScreen media={videoMedia} onDismiss={onDismiss} ready />)
+    expect(screen).toHaveAttribute('data-fading', 'false')
+    act(() => vi.advanceTimersByTime(POWER_ON_MIN_DURATION_MS - 1))
+    expect(screen).toHaveAttribute('data-fading', 'false')
+    act(() => vi.advanceTimersByTime(1))
     expect(screen).toHaveAttribute('data-fading', 'true')
     expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled()
     expect(onDismiss).not.toHaveBeenCalled()
@@ -114,40 +100,58 @@ describe('Power On screen', () => {
     expect(onDismiss).toHaveBeenCalledOnce()
   })
 
-  it('keeps Power On until the nine-second deadline when startup is slow', () => {
-    const { container, onDismiss } = powerOn({
-      animation: { kind: 'video', src: '/power-on/animation/power-on.webm' },
-      logo: '/power-on/logo/power-on-logo.png',
-    })
+  it('configures a 3.5-second minimum and the expected fade duration', () => {
+    expect(POWER_ON_MIN_DURATION_MS).toBe(3500)
+    expect(POWER_ON_FADE_DURATION_MS).toBe(450)
+  })
+
+  it('keeps Power On visible past the video duration while startup is still pending', () => {
+    const { container, onDismiss, rerender } = powerOn(videoMedia)
     flushAnimationFrames()
     const screen = container.querySelector('.power-on-screen')!
+    const video = container.querySelector('video')!
 
-    act(() => vi.advanceTimersByTime(POWER_ON_FADE_OUT_AT_MS))
+    expect(video).toHaveAttribute('loop')
+    act(() => vi.advanceTimersByTime(30_000))
+    fireEvent.ended(video)
+    expect(screen).toHaveAttribute('data-fading', 'false')
+    expect(video).toBeInTheDocument()
+    expect(HTMLMediaElement.prototype.pause).not.toHaveBeenCalled()
+    expect(onDismiss).not.toHaveBeenCalled()
+
+    rerender(<PowerOnScreen media={videoMedia} onDismiss={onDismiss} ready />)
     expect(screen).toHaveAttribute('data-fading', 'true')
     expect(HTMLMediaElement.prototype.pause).toHaveBeenCalledOnce()
-    expect(onDismiss).not.toHaveBeenCalled()
     expect(screen).toHaveStyle({
       '--power-on-fade-duration': `${POWER_ON_FADE_DURATION_MS}ms`,
     })
-    act(() => vi.advanceTimersByTime(POWER_ON_HARD_STOP_AT_MS - POWER_ON_FADE_OUT_AT_MS))
+    fireEvent.transitionEnd(screen, { propertyName: 'opacity' })
     expect(onDismiss).toHaveBeenCalledOnce()
-    expect(POWER_ON_HARD_STOP_AT_MS).toBe(POWER_ON_MAX_DURATION_MS)
-    expect(POWER_ON_MAX_DURATION_MS).toBe(9000)
   })
 
   it('does not wait for failed media to transition away from the screen', () => {
-    const { container, onDismiss } = powerOn({
-      animation: { kind: 'video', src: '/power-on/animation/missing.mp4' },
-      logo: '/power-on/logo/missing.png',
+    const { container, onDismiss, rerender } = powerOn({
+      animation: { kind: 'video', src: '/power-on/animation/missing.webm' },
+      logo: null,
     })
     flushAnimationFrames()
 
     fireEvent.error(container.querySelector('video')!)
-    fireEvent.error(container.querySelector('img')!)
-    act(() => vi.advanceTimersByTime(POWER_ON_FADE_OUT_AT_MS))
-    expect(container.querySelector('.power-on-screen')).toHaveAttribute('data-fading', 'true')
-    act(() => vi.advanceTimersByTime(POWER_ON_HARD_STOP_AT_MS - POWER_ON_FADE_OUT_AT_MS))
-
+    act(() => vi.advanceTimersByTime(POWER_ON_MIN_DURATION_MS))
+    expect(container.querySelector('.power-on-screen')).toHaveAttribute('data-fading', 'false')
+    rerender(
+      <PowerOnScreen
+        media={{
+          animation: { kind: 'video', src: '/power-on/animation/missing.webm' },
+          logo: null,
+        }}
+        onDismiss={onDismiss}
+        ready
+      />,
+    )
+    const readyScreen = container.querySelector('.power-on-screen')!
+    expect(readyScreen).toHaveAttribute('data-fading', 'true')
+    fireEvent.transitionEnd(readyScreen, { propertyName: 'opacity' })
     expect(onDismiss).toHaveBeenCalledOnce()
   })
 })

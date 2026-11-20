@@ -3,12 +3,12 @@
 import { openUrl } from '@tauri-apps/plugin-opener'
 import { FilePlus2, FolderOpen, LoaderCircle, Settings } from 'lucide-react'
 import Image from 'next/image'
-import { useState, type ComponentProps } from 'react'
+import { useEffect, useRef, useState, type ComponentProps } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { AboutDialog } from '@/components/app/AboutDialog'
 import { useMacOS, WindowControls } from '@/components/app/WindowChrome'
-import { call } from '@/lib/backend'
+import { call, savePreferences } from '@/lib/backend'
 import { selectableLayer } from '@/lib/geometry'
 import {
   pageKey,
@@ -21,8 +21,18 @@ import {
   useProject,
   useWorkspacePage,
 } from '@/lib/queries'
-import { useNorrixStore } from '@/lib/store'
-import { commands, type Operation, type Scope, type Stage } from '@norrix/bridge/protocol'
+import {
+  receiveError,
+  receivePreferences,
+  useNorrixStore,
+} from '@/lib/store'
+import {
+  commands,
+  type Operation,
+  type Scope,
+  type Stage,
+  type ViewPreferences,
+} from '@norrix/bridge/protocol'
 import {
   Menubar,
   MenubarContent as UiMenubarContent,
@@ -35,6 +45,7 @@ import {
   MenubarSubTrigger,
   MenubarTrigger as UiMenubarTrigger,
 } from '@norrix/ui/components/menubar'
+import { Button } from '@norrix/ui/components/button'
 import { cn } from '@norrix/ui/lib/utils'
 import logo from '../../../../crates/norrix/icons/icon.png'
 
@@ -52,6 +63,41 @@ export function TitleBar() {
   const selectLayers = useNorrixStore((state) => state.selectLayers)
   const setSettingsOpen = useNorrixStore((state) => state.setSettingsOpen)
   const requestCanvasFit = useNorrixStore((state) => state.requestCanvasFit)
+  const preferences = useNorrixStore((state) => state.preferences)
+  const viewPreferences = preferences?.view ?? null
+  const viewPreferencesRef = useRef(viewPreferences)
+  const viewSaveQueue = useRef<Promise<void>>(Promise.resolve())
+
+  useEffect(() => {
+    viewPreferencesRef.current = viewPreferences
+  }, [viewPreferences])
+
+  const updateViewPreferences = (update: Partial<ViewPreferences>) => {
+    const current = viewPreferencesRef.current
+    if (!current) return
+    const next = { ...current, ...update }
+    viewPreferencesRef.current = next
+    const pending = viewSaveQueue.current
+      .catch(() => undefined)
+      .then(async () => {
+        const latest = useNorrixStore.getState().preferences
+        if (!latest) throw new Error('Preferences are not loaded.')
+        const saved = await savePreferences(
+          latest.pipeline,
+          latest.providers,
+          latest.typesetting,
+          next,
+        )
+        receivePreferences(saved)
+      })
+    viewSaveQueue.current = pending.then(
+      () => undefined,
+      () => undefined,
+    )
+    void pending.catch((error: unknown) =>
+      receiveError(error instanceof Error ? error.message : String(error)),
+    )
+  }
   const { importPages, importing } = useImportPages()
   const { run: exportProject, busy: exporting } = useCommand(
     ['export-project'],
@@ -235,10 +281,69 @@ export function TitleBar() {
 
           <MenubarMenu>
             <MenubarTrigger>{t('menu.view')}</MenubarTrigger>
-            <MenubarContent>
+            <MenubarContent className='w-[32rem] max-w-[calc(100vw-2rem)]'>
               <MenubarItem disabled={!page} onClick={requestCanvasFit}>
                 {t('menu.fit')}
               </MenubarItem>
+              <UiMenubarSeparator />
+              <div className='grid min-w-56 gap-3 p-2'>
+                <fieldset className='grid gap-1.5' disabled={!viewPreferences}>
+                  <legend className='mb-1 text-[10px] font-medium text-muted-foreground'>
+                    {t('menu.textBoxOutlines')}
+                  </legend>
+                  <div className='grid grid-cols-2 gap-1' role='group'>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant={viewPreferences?.text_box_outlines ? 'secondary' : 'ghost'}
+                      aria-pressed={viewPreferences?.text_box_outlines ?? false}
+                      disabled={!viewPreferences}
+                      className='h-7 px-2 text-[10px]'
+                      onClick={() => updateViewPreferences({ text_box_outlines: true })}
+                    >
+                      {t('menu.detectionOutlinesAlways')}
+                    </Button>
+                    <Button
+                      type='button'
+                      size='sm'
+                      variant={viewPreferences && !viewPreferences.text_box_outlines ? 'secondary' : 'ghost'}
+                      aria-pressed={viewPreferences ? !viewPreferences.text_box_outlines : false}
+                      disabled={!viewPreferences}
+                      className='h-7 px-2 text-[10px]'
+                      onClick={() => updateViewPreferences({ text_box_outlines: false })}
+                    >
+                      {t('menu.textBoxOutlinesDisabled')}
+                    </Button>
+                  </div>
+                </fieldset>
+                <fieldset className='grid gap-1.5' disabled={!viewPreferences}>
+                  <legend className='mb-1 text-[10px] font-medium text-muted-foreground'>
+                    {t('menu.detectionOutlines')}
+                  </legend>
+                  <div className='grid grid-cols-3 gap-1' role='group'>
+                    {(['never', 'selected', 'always'] as const).map((mode) => (
+                      <Button
+                        key={mode}
+                        type='button'
+                        size='sm'
+                        variant={
+                          viewPreferences?.detection_outlines === mode ? 'secondary' : 'ghost'
+                        }
+                        aria-pressed={viewPreferences?.detection_outlines === mode}
+                        disabled={!viewPreferences}
+                        className='h-7 px-2 text-[10px]'
+                        onClick={() => updateViewPreferences({ detection_outlines: mode })}
+                      >
+                        {mode === 'never'
+                          ? t('menu.detectionOutlinesNever')
+                          : mode === 'selected'
+                            ? t('menu.detectionOutlinesOnSelection')
+                            : t('menu.detectionOutlinesAlways')}
+                      </Button>
+                    ))}
+                  </div>
+                </fieldset>
+              </div>
             </MenubarContent>
           </MenubarMenu>
 

@@ -1,6 +1,4 @@
-use std::fmt::Write;
-
-use anyhow::Context;
+use anyhow::{Context, bail};
 use indoc::indoc;
 use serde::{Deserialize, Deserializer, Serialize, de};
 use serde_json::{Value, json};
@@ -30,54 +28,45 @@ pub(crate) fn translations(
 ) -> anyhow::Result<Vec<String>> {
     let output = serde_json::from_str::<TranslationOutput>(text).with_context(|| {
         format!(
-            "{provider} returned invalid translation JSON for {} segments; response was: {}",
+            "{provider} returned invalid translation JSON for {} segments",
             source_segments.len(),
-            snippet(text),
         )
     })?;
     let mut translations = source_segments.to_vec();
     let mut translated = vec![false; source_segments.len()];
 
     for translation in output.translations {
-        if translation.id < translations.len() && !translated[translation.id] {
-            translations[translation.id] = translation.text;
-            translated[translation.id] = true;
+        if translation.id >= translations.len() {
+            bail!(
+                "{provider} returned out-of-range segment ID {}; expected 0..{}",
+                translation.id,
+                translations.len()
+            );
         }
+        if translated[translation.id] {
+            bail!(
+                "{provider} returned duplicate segment ID {}",
+                translation.id
+            );
+        }
+        if translation.text.trim().is_empty() {
+            bail!(
+                "{provider} returned an empty translation for segment {} of {}",
+                translation.id,
+                source_segments.len()
+            );
+        }
+        translations[translation.id] = translation.text;
+        translated[translation.id] = true;
+    }
+    if let Some(missing) = translated.iter().position(|translated| !translated) {
+        bail!(
+            "{provider} returned an incomplete translation; segment {missing} of {} is missing",
+            source_segments.len()
+        );
     }
 
     Ok(translations)
-}
-
-/// Keeps a model response readable in a log line without truncating so hard
-/// that the shape of the failure is lost.
-///
-/// Responses are usually pretty-printed, so line breaks and other control
-/// characters are escaped rather than passed through: the snippet is formatted
-/// into an error context, and one failure should stay one line.
-pub(crate) fn snippet(text: &str) -> String {
-    const LIMIT: usize = 2000;
-    let trimmed = text.trim();
-    let (visible, elided) = match trimmed.char_indices().nth(LIMIT) {
-        Some((end, _)) => (&trimmed[..end], true),
-        None => (trimmed, false),
-    };
-
-    let mut output = String::with_capacity(visible.len());
-    for character in visible.chars() {
-        match character {
-            '\n' => output.push_str("\\n"),
-            '\r' => output.push_str("\\r"),
-            '\t' => output.push_str("\\t"),
-            control if control.is_control() => {
-                let _ = write!(output, "\\u{{{:04x}}}", control as u32);
-            }
-            character => output.push(character),
-        }
-    }
-    if elided {
-        let _ = write!(output, "… ({} bytes total)", trimmed.len());
-    }
-    output
 }
 
 pub(crate) fn output_schema(expected: usize) -> Value {
@@ -219,31 +208,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snippet_keeps_a_response_on_one_line() {
-        let flattened = snippet("{\n  \"translations\": [\n\t\"hello\"\n  ]\n}");
-
-        assert!(!flattened.contains('\n'), "{flattened}");
-        assert!(!flattened.contains('\t'), "{flattened}");
-        assert_eq!(flattened, r#"{\n  "translations": [\n\t"hello"\n  ]\n}"#);
-    }
-
-    #[test]
-    fn snippet_escapes_other_control_characters() {
-        assert_eq!(snippet("before\u{7}after"), r"before\u{0007}after");
-    }
-
-    #[test]
-    fn snippet_reports_the_length_it_elided() {
-        let flattened = snippet(&"x".repeat(2_500));
-
-        assert!(flattened.starts_with(&"x".repeat(2_000)));
-        assert!(
-            flattened.ends_with("\u{2026} (2500 bytes total)"),
-            "{flattened}"
-        );
-    }
-
-    #[test]
     fn parses_plain_json() {
         let source = ["one".to_owned(), "two".to_owned()];
         let response = r#"{"translations":[{"id":0,"text":"hello"},{"id":1,"text":"world"}]}"#;
@@ -271,9 +235,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_error_preserves_the_root_failure_and_response() {
+    fn parse_error_preserves_the_root_failure_without_logging_response_content() {
         let source = ["one".to_owned()];
-        let response = "{\n  \"translations\": [{\"id\": 0}]\n}";
+        let response =
+            "{\n  \"private dialogue\": \"do not log\", \"translations\": [{\"id\": 0}]\n}";
         let error = format!(
             "{:#}",
             translations("test", response, &source).expect_err("missing text should fail")
@@ -281,9 +246,10 @@ mod tests {
 
         assert!(error.contains("missing field `text`"), "{error}");
         assert!(
-            error.contains(r#"response was: {\n  "translations": [{"id": 0}]\n}"#),
+            error.contains("invalid translation JSON for 1 segments"),
             "{error}"
         );
+        assert!(!error.contains("do not log"), "{error}");
     }
 
     #[test]
@@ -297,24 +263,47 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_duplicate_missing_and_out_of_range_ids() {
+    fn rejects_duplicate_and_out_of_range_segment_ids() {
         let source = ["one".to_owned(), "two".to_owned()];
         let short = r#"{"translations":[{"id":1,"text":"world"}]}"#;
-        assert_eq!(
-            translations("test", short, &source).unwrap(),
-            ["one", "world"]
+        assert!(
+            translations("test", short, &source)
+                .unwrap_err()
+                .to_string()
+                .contains("segment 0")
         );
 
-        let response = concat!(
+        let duplicate = concat!(
             r#"{"translations":["#,
             r#"{"id":0,"text":"hello"},"#,
             r#"{"id":0,"text":"duplicate"},"#,
-            r#"{"id":9,"text":"extra"}"#,
+            r#"{"id":1,"text":"world"}"#,
             "]}"
         );
-        assert_eq!(
-            translations("test", response, &source).unwrap(),
-            ["hello", "two"]
+        assert!(
+            translations("test", duplicate, &source)
+                .unwrap_err()
+                .to_string()
+                .contains("duplicate segment ID")
+        );
+        let out_of_range = r#"{"translations":[{"id":0,"text":"hello"},{"id":1,"text":"world"},{"id":9,"text":"extra"}]}"#;
+        assert!(
+            translations("test", out_of_range, &source)
+                .unwrap_err()
+                .to_string()
+                .contains("out-of-range segment ID")
+        );
+    }
+
+    #[test]
+    fn rejects_empty_translation_segments() {
+        let source = ["one".to_owned()];
+        let response = r#"{"translations":[{"id":0,"text":"  \n"}]}"#;
+        assert!(
+            translations("test", response, &source)
+                .unwrap_err()
+                .to_string()
+                .contains("empty translation")
         );
     }
 

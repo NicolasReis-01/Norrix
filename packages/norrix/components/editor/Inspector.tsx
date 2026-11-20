@@ -43,10 +43,11 @@ import {
   queryClient,
   refresh,
   useFonts,
+  usePages,
   useProject,
   useWorkspacePage,
 } from '@/lib/queries'
-import { useNorrixStore } from '@/lib/store'
+import { receiveError, useNorrixStore } from '@/lib/store'
 import { previewCanvasOpacity } from '@norrix/bridge/canvas'
 import {
   commands,
@@ -538,6 +539,7 @@ function displayedLayers(layers: Layer[], page: EntityId) {
 function LayersInspector() {
   const { t } = useTranslation()
   const page = useWorkspacePage().data
+  const pageSummary = usePages().data?.find((summary) => summary.id === page?.id)
   const selected = useNorrixStore((state) => state.selectedLayers)
   const selectLayers = useNorrixStore((state) => state.selectLayers)
   const [expandedLayer, setExpandedLayer] = useState<EntityId | null>(
@@ -636,6 +638,14 @@ function LayersInspector() {
         <span className='text-[9px] text-muted-foreground tabular-nums'>
           {page.layers.filter((layer) => !isGroupLayer(layer)).length}
         </span>
+        {pageSummary?.ocr_complete ? (
+          <span
+            aria-label={t('progress.ocrComplete', { defaultValue: 'OCR complete' })}
+            className='ml-auto rounded-sm bg-[#ffac80]/10 px-1 text-[8px] leading-3 text-[#ffac80]'
+          >
+            OCR
+          </span>
+        ) : null}
       </header>
 
       <ScrollArea className='min-h-0 flex-1'>
@@ -740,6 +750,16 @@ function LayerRow({
               <span className='block truncate text-[9px] leading-3 text-muted-foreground capitalize'>
                 {detail}
               </span>
+              {layer.type === 'text' && layer.content.translation_complete ? (
+                <span
+                  aria-label={t('progress.translationComplete', {
+                    defaultValue: 'Translation complete',
+                  })}
+                  className='mt-0.5 inline-flex rounded-sm bg-[#ffac80]/10 px-1 text-[8px] leading-3 text-[#ffac80]'
+                >
+                  TRD
+                </span>
+              ) : null}
             </span>
           </button>
           {!locked && (
@@ -787,25 +807,49 @@ function LayerRow({
               <TooltipContent side='left'>{t('layers.locked')}</TooltipContent>
             </Tooltip>
           ) : (
-            <button
-              type='button'
-              aria-label={
-                layer.visibility.visible ? t('layers.hide', { name }) : t('layers.show', { name })
-              }
-              className='grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25'
-              onClick={onToggle}
-            >
-              {layer.visibility.visible ? (
-                <Eye className='size-3.5' />
-              ) : (
-                <EyeOff className='size-3.5' />
+            <>
+              <button
+                type='button'
+                aria-label={
+                  layer.visibility.visible ? t('layers.hide', { name }) : t('layers.show', { name })
+                }
+                className='grid size-6 shrink-0 place-items-center rounded-md text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground focus-visible:ring-2 focus-visible:ring-ring/25'
+                onClick={onToggle}
+              >
+                {layer.visibility.visible ? (
+                  <Eye className='size-3.5' />
+                ) : (
+                  <EyeOff className='size-3.5' />
+                )}
+              </button>
+              {onDelete && (
+                <Tooltip>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        type='button'
+                        variant='ghost'
+                        size='icon-xs'
+                        aria-label={t('layers.delete', { name })}
+                        className='size-6 shrink-0 rounded-md text-muted-foreground hover:bg-foreground/[0.06] hover:text-foreground'
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          onDelete()
+                        }}
+                      />
+                    }
+                  >
+                    <Trash2 className='size-3.5' />
+                  </TooltipTrigger>
+                  <TooltipContent side='left'>{t('layers.delete', { name })}</TooltipContent>
+                </Tooltip>
               )}
-            </button>
+            </>
           )}
         </div>
         {expanded && (
           <div className='animate-in duration-150 fade-in slide-in-from-top-1 motion-reduce:animate-none'>
-            <LayerEditor layer={layer} onDelete={onDelete} />
+            <LayerEditor layer={layer} />
           </div>
         )}
       </div>
@@ -813,7 +857,7 @@ function LayerRow({
   )
 }
 
-function LayerEditor({ layer, onDelete }: { layer: Layer; onDelete?: () => void }) {
+function LayerEditor({ layer }: { layer: Layer }) {
   const { t } = useTranslation()
   const name = localizedLayerName(layer, 0, t)
   const [opacity, setOpacity] = useState(layer.visibility.opacity * 100)
@@ -864,25 +908,6 @@ function LayerEditor({ layer, onDelete }: { layer: Layer; onDelete?: () => void 
             {Math.round(opacity)}%
           </span>
         </div>
-        {onDelete && (
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <Button
-                  type='button'
-                  variant='ghost'
-                  size='icon-xs'
-                  aria-label={t('layers.delete', { name })}
-                  className='size-5 rounded-md text-muted-foreground hover:text-foreground'
-                  onClick={onDelete}
-                />
-              }
-            >
-              <Trash2 className='size-3' />
-            </TooltipTrigger>
-            <TooltipContent side='left'>{t('layers.delete', { name })}</TooltipContent>
-          </Tooltip>
-        )}
       </div>
       {isTextLayer(layer) && (
         <>
@@ -925,10 +950,12 @@ function LayerEditor({ layer, onDelete }: { layer: Layer; onDelete?: () => void 
               wrap='soft'
               className='max-h-14 min-h-8 w-full max-w-full min-w-0 resize-y overflow-y-auto rounded-md bg-background px-1.5 py-1 text-[12px] leading-4 md:text-[12px]'
               value={layer.content.source?.text ?? ''}
-              onCommit={(text) =>
-                void call(commands.setSourceText, layer.id, text, null)
-                  .then(() => refresh(projectKey, pageKey))
-                  .catch(() => undefined)
+              onCommit={(text, editSession) =>
+                void call(commands.setSourceText, layer.id, text, editSession)
+                  .then(() => (editSession === null ? refresh(projectKey, pageKey) : undefined))
+                  .catch((error: unknown) =>
+                    receiveError(error instanceof Error ? error.message : String(error)),
+                  )
               }
             />
           </InspectorField>
@@ -939,10 +966,12 @@ function LayerEditor({ layer, onDelete }: { layer: Layer; onDelete?: () => void 
               wrap='soft'
               className='max-h-16 min-h-9 w-full max-w-full min-w-0 resize-y overflow-y-auto rounded-md border-primary/25 bg-background px-1.5 py-1 text-[12px] leading-4 md:text-[12px]'
               value={layer.content.translation?.text ?? ''}
-              onCommit={(text) =>
-                void call(commands.setTranslation, layer.id, text.trim() ? text : null, null)
-                  .then(() => refresh(projectKey, pageKey))
-                  .catch(() => undefined)
+              onCommit={(text, editSession) =>
+                void call(commands.setTranslation, layer.id, text.trim() ? text : null, editSession)
+                  .then(() => (editSession === null ? refresh(projectKey, pageKey) : undefined))
+                  .catch((error: unknown) =>
+                    receiveError(error instanceof Error ? error.message : String(error)),
+                  )
               }
             />
           </InspectorField>

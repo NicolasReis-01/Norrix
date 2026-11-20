@@ -6,12 +6,13 @@ import {
   renderHook,
   screen,
   waitFor,
+  within,
 } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { ThemeProvider } from 'next-themes'
 import { StrictMode, type ReactNode } from 'react'
 import { describe, expect, it, vi } from 'vitest'
 
+import { ThemeProvider } from '@/components/app/ThemeProvider'
 import { TitleBar } from '@/components/app/TitleBar'
 import { WindowControls } from '@/components/app/WindowChrome'
 import { ActivityCenter } from '@/components/editor/ActivityCenter'
@@ -80,6 +81,7 @@ const textLayer: Layer = {
     id: 'content',
     source: { text: 'こんにちは', language: 'ja' },
     translation: { text: 'Hello', language: null },
+    translation_complete: true,
     role: null,
     source_region: null,
   },
@@ -186,6 +188,10 @@ const preferences: Preferences = {
   typesetting: {
     font_families: ['Noto Sans'],
   },
+  view: {
+    text_box_outlines: false,
+    detection_outlines: 'selected',
+  },
   languages: [
     { tag: 'en-US', name: 'English' },
     { tag: 'ja-JP', name: 'Japanese' },
@@ -214,6 +220,12 @@ function installProject() {
       size: { width: 1000, height: 1500 },
       source_asset: 'source',
       layer_count: 1,
+      detection_complete: false,
+      ocr_complete: false,
+      translation_complete: true,
+      inpainting_complete: false,
+      translated_texts: 1,
+      total_texts: 1,
     },
   ])
   queryClient.setQueryData(pageKey, page)
@@ -506,6 +518,103 @@ describe('greenfield editor', () => {
     expect(await screen.findByRole('status')).toHaveTextContent('3 selected')
   })
 
+  it('preserves PageRail scrollTop when the active page remains in the visible region', async () => {
+    installProject()
+    const first = queryClient.getQueryData<PageSummary[]>(pagesKey)![0]!
+    const pages = Array.from({ length: 40 }, (_, index) => ({
+      ...first,
+      id: index === 0 ? 'page' : `page-${index + 1}`,
+      label: `Page ${index + 1}`,
+    }))
+    const target = pages[8]!
+    queryClient.setQueryData(pagesKey, pages)
+    const targetPage = {
+      ...queryClient.getQueryData<Page>(pageKey)!,
+      id: target.id,
+      label: target.label,
+    }
+    queryClient.setQueryDefaults(preparedPageKey(target.id), { staleTime: Infinity })
+    queryClient.setQueryData(preparedPageKey(target.id), {
+      revision: 1,
+      page: targetPage,
+      element_frames: [],
+      text_font_sizes: [],
+    })
+    render(<PageRail />)
+    act(() => useNorrixStore.setState({ workspaceMode: 'infinite' }))
+
+    const viewport = document.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')
+    expect(viewport).not.toBeNull()
+    Object.defineProperties(viewport, {
+      scrollHeight: { configurable: true, value: 2958 },
+      clientHeight: { configurable: true, value: 600 },
+    })
+    viewport!.scrollTop = 437.25
+    fireEvent.scroll(viewport!)
+    act(() =>
+      useNorrixStore.setState({
+        selectedPage: target.id,
+        canvasPage: target.id,
+        canvasRevision: 1,
+      }),
+    )
+
+    await waitFor(() => expect(useNorrixStore.getState().selectedPage).toBe(target.id))
+    expect(viewport!.scrollTop).toBe(437.25)
+  })
+
+  it('follows distant active pages in Infinite Scroll without using stale query selection', async () => {
+    installProject()
+    const first = queryClient.getQueryData<PageSummary[]>(pagesKey)![0]!
+    const pages = Array.from({ length: 40 }, (_, index) => ({
+      ...first,
+      id: index === 0 ? 'page' : `page-${index + 1}`,
+      label: `Page ${index + 1}`,
+    }))
+    const target = pages[34]!
+    queryClient.setQueryData(pagesKey, pages)
+    const targetPage = {
+      ...queryClient.getQueryData<Page>(pageKey)!,
+      id: target.id,
+      label: target.label,
+    }
+    queryClient.setQueryDefaults(preparedPageKey(target.id), { staleTime: Infinity })
+    queryClient.setQueryData(preparedPageKey(target.id), {
+      revision: 1,
+      page: targetPage,
+      element_frames: [],
+      text_font_sizes: [],
+    })
+    render(<PageRail />)
+    act(() => useNorrixStore.setState({ workspaceMode: 'infinite' }))
+
+    const viewport = document.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]')
+    expect(viewport).not.toBeNull()
+    Object.defineProperties(viewport, {
+      scrollHeight: { configurable: true, value: 2958 },
+      clientHeight: { configurable: true, value: 600 },
+    })
+    const scrollTo = vi.fn((options: ScrollToOptions | number, y?: number) => {
+      viewport!.scrollTop = typeof options === 'number' ? (y ?? options) : (options.top ?? 0)
+      fireEvent.scroll(viewport!)
+    })
+    Object.defineProperty(viewport, 'scrollTo', { configurable: true, value: scrollTo })
+    viewport!.scrollTop = 437.25
+    fireEvent.scroll(viewport!)
+    act(() =>
+      useNorrixStore.setState({
+        selectedPage: target.id,
+        canvasPage: target.id,
+        canvasRevision: 1,
+      }),
+    )
+
+    await waitFor(() => expect(useNorrixStore.getState().selectedPage).toBe(target.id))
+    expect(scrollTo).toHaveBeenCalled()
+    await waitFor(() => expect(viewport!.scrollTop).toBeGreaterThan(437.25))
+    expect(document.querySelector(`[data-index="34"]`)).not.toBeNull()
+  })
+
   it('loads page thumbnails into the filmstrip', async () => {
     installProject()
     const thumbnail = vi.spyOn(commands, 'getThumbnail').mockResolvedValue([1])
@@ -516,6 +625,65 @@ describe('greenfield editor', () => {
       'blob:norrix-thumbnail',
     )
     expect(screen.queryByText('01')).not.toBeInTheDocument()
+  })
+
+  it('shows only marked page stages in Clarissimo and counts partial translations', async () => {
+    installProject()
+    render(<PageRail />)
+    const article = screen.getByText('Page 1').closest('article')
+    expect(article).not.toBeNull()
+    expect(within(article!).queryByText('DTC')).not.toBeInTheDocument()
+    expect(within(article!).queryByText('OCR')).not.toBeInTheDocument()
+    expect(within(article!).queryByText('PRE')).not.toBeInTheDocument()
+    expect(within(article!).getByText('TRD 1/1')).toHaveClass('text-[#ffac80]')
+
+    queryClient.setQueryData<PageSummary[]>(pagesKey, [
+      {
+        ...queryClient.getQueryData<PageSummary[]>(pagesKey)![0]!,
+        detection_complete: true,
+        ocr_complete: true,
+        inpainting_complete: true,
+        translated_texts: 1,
+        total_texts: 2,
+      },
+    ])
+
+    await waitFor(() => {
+      expect(within(article!).getByText('DTC')).toHaveClass('text-[#ffac80]')
+      expect(within(article!).getByText('OCR')).toHaveClass('text-[#ffac80]')
+      expect(within(article!).getByText('TRD 1/2')).toHaveClass('text-[#ffac80]')
+      expect(within(article!).getByText('PRE')).toHaveClass('text-[#ffac80]')
+    })
+  })
+
+  it('marks a whole page translated through its page actions', async () => {
+    installProject()
+    queryClient.setQueryData<PageSummary[]>(pagesKey, [
+      {
+        ...queryClient.getQueryData<PageSummary[]>(pagesKey)![0]!,
+        translation_complete: false,
+      },
+    ])
+    const mark = vi.spyOn(commands, 'setProgressMarkers').mockResolvedValue(null)
+    render(<PageRail />)
+
+    await userEvent.click(screen.getByRole('button', { name: 'Mark page as translated' }))
+
+    await waitFor(() => expect(mark).toHaveBeenCalledWith(['page'], null, 'translation', true))
+  })
+
+  it('shows OCR at page level and TRD on translated text layers', () => {
+    installProject()
+    queryClient.setQueryData<PageSummary[]>(pagesKey, [
+      {
+        ...queryClient.getQueryData<PageSummary[]>(pagesKey)![0]!,
+        ocr_complete: true,
+      },
+    ])
+    render(<Inspector />)
+
+    expect(screen.getByLabelText('OCR complete')).toHaveTextContent('OCR')
+    expect(screen.getByLabelText('Translation complete')).toHaveTextContent('TRD')
   })
 
   it('keeps rapid page switches on the latest native selection', async () => {
@@ -738,6 +906,63 @@ describe('greenfield editor', () => {
     )
   })
 
+  it('routes progress markers to the selected text or selected pages', async () => {
+    installProject()
+    const updateMarkers = vi.spyOn(commands, 'setProgressMarkers').mockResolvedValue(null)
+    render(
+      <TooltipProvider>
+        <ToolBar />
+      </TooltipProvider>,
+    )
+
+    fireEvent.click(
+      screen.getByRole('button', { name: 'TRD — Toggle selected text translation marker' }),
+    )
+    await waitFor(() =>
+      expect(updateMarkers).toHaveBeenLastCalledWith([], 'element', 'translation', false),
+    )
+    expect(
+      screen.getByRole('button', { name: 'DTC — Toggle page processing marker' }),
+    ).toBeDisabled()
+  })
+
+  it('routes page progress markers to the selected pages', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, [
+      ...(queryClient.getQueryData<PageSummary[]>(pagesKey) ?? []),
+      {
+        id: 'page-2',
+        label: 'Page 2',
+        size: { width: 1000, height: 1500 },
+        source_asset: 'source-2',
+        layer_count: 0,
+        detection_complete: false,
+        ocr_complete: false,
+        translation_complete: false,
+        inpainting_complete: false,
+        translated_texts: 0,
+        total_texts: 0,
+      },
+    ])
+    act(() => useNorrixStore.setState({ selectedLayers: [], selectedPages: ['page', 'page-2'] }))
+    const updateMarkers = vi.spyOn(commands, 'setProgressMarkers').mockResolvedValue(null)
+    render(
+      <TooltipProvider>
+        <ToolBar />
+      </TooltipProvider>,
+    )
+
+    await waitFor(() =>
+      expect(
+        screen.getByRole('button', { name: 'DTC — Toggle page processing marker' }),
+      ).toBeEnabled(),
+    )
+    fireEvent.click(screen.getByRole('button', { name: 'DTC — Toggle page processing marker' }))
+    await waitFor(() =>
+      expect(updateMarkers).toHaveBeenLastCalledWith(['page', 'page-2'], null, 'detection', true),
+    )
+  })
+
   it('applies Unicode title case to the source text and persists the transformed value', async () => {
     const user = userEvent.setup()
     installProject()
@@ -912,6 +1137,105 @@ describe('greenfield editor', () => {
     expect(setTypography).not.toHaveBeenCalled()
   })
 
+  it('renders independent text and detection outlines without selection or translation', () => {
+    installProject()
+    const page = queryClient.getQueryData<Page>(pageKey)!
+    const regionId = 'region-without-translation'
+    const region = {
+      id: regionId,
+      parent: null,
+      geometry: {
+        points: [
+          { x: 1, y: 1 },
+          { x: 20, y: 1 },
+          { x: 20, y: 20 },
+        ],
+      },
+      kind: 'text',
+      label: null,
+    }
+    const pageWithoutTranslation: Page = {
+      ...page,
+      layers: page.layers.map((layer) =>
+        layer.type === 'text'
+          ? {
+              ...layer,
+              automatic_region: regionId,
+              content: {
+                ...layer.content,
+                source: layer.content.source
+                  ? {
+                      ...layer.content.source,
+                      text: '',
+                      language: layer.content.source.language ?? null,
+                    }
+                  : { text: '', language: null },
+                translation: null,
+                translation_complete: false,
+              },
+            }
+          : layer,
+      ),
+      regions: [region],
+    }
+    useNorrixStore.setState({
+      preferences: {
+        ...preferences,
+        view: { text_box_outlines: true, detection_outlines: 'always' },
+      },
+    })
+    const props = {
+      page: pageWithoutTranslation,
+      camera: { zoom: 1, translation: [0, 0] as [number, number] },
+      selected: [],
+      hovered: null,
+      frames: { element: { x: 10, y: 20, width: 100, height: 50, angle_degrees: 0 } },
+      previews: {},
+      draft: null,
+      cursor: null,
+      brushSize: 1,
+      showBrushCursor: false,
+      editing: null,
+      onTextEditChange: vi.fn(),
+      onTextEditEnd: vi.fn(),
+      onTextLayoutPreview: async () => {
+        throw new Error('not used')
+      },
+      onTextLayoutPreviewError: vi.fn(),
+      onTransformStart: vi.fn(),
+      onTransformFrame: vi.fn(),
+      onTransformEnd: vi.fn(),
+      onTransformCancel: vi.fn(),
+    }
+    const view = render(<CanvasOverlay {...props} />)
+
+    expect(screen.getByTestId('text-fit-region')).toBeInTheDocument()
+    expect(
+      (view.container.querySelector('[data-element="element"]') as HTMLElement).style.border,
+    ).toBe('1px solid var(--canvas-selection)')
+
+    useNorrixStore.setState({
+      preferences: {
+        ...preferences,
+        view: { text_box_outlines: false, detection_outlines: 'never' },
+      },
+    })
+    view.rerender(<CanvasOverlay {...props} />)
+    expect(screen.queryByTestId('text-fit-region')).not.toBeInTheDocument()
+    expect(
+      (view.container.querySelector('[data-element="element"]') as HTMLElement).style.border,
+    ).toBe('')
+
+    useNorrixStore.setState({
+      preferences: {
+        ...preferences,
+        view: { text_box_outlines: false, detection_outlines: 'selected' },
+      },
+    })
+    view.rerender(<CanvasOverlay {...props} selected={['element']} />)
+    expect(screen.getByTestId('text-fit-region')).toBeInTheDocument()
+  })
+
   it('previews fitted font size in the resized text box without changing its saved typography', () => {
     installProject()
     const textPage = queryClient.getQueryData<Page>(pageKey)!
@@ -976,6 +1300,12 @@ describe('greenfield editor', () => {
       size: { width: 1000, height: 1500 },
       source_asset: null,
       layer_count: 1,
+      detection_complete: false,
+      ocr_complete: false,
+      translation_complete: false,
+      inpainting_complete: false,
+      translated_texts: 0,
+      total_texts: 0,
     }
     const pageOne: Page = {
       ...queryClient.getQueryData<Page>(pageKey)!,
@@ -1329,6 +1659,46 @@ describe('greenfield editor', () => {
     await waitFor(() => expect(save).toHaveBeenCalledWith('element', 'corrected OCR', null))
   })
 
+  it('keeps translation input focused through paused session saves and page updates', async () => {
+    installProject()
+    const save = vi.spyOn(commands, 'setTranslation').mockResolvedValue(null)
+    render(<Inspector />)
+    const translation = screen.getByTestId('edit-translation-element')
+    translation.focus()
+    fireEvent.change(translation, { target: { value: 'Texto inicial' } })
+
+    await waitFor(() => expect(save).toHaveBeenCalledOnce())
+    const session = save.mock.calls[0]?.[2]
+    expect(session).toEqual(expect.any(String))
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 1200)))
+
+    expect(translation).toHaveFocus()
+    expect(translation).toHaveValue('Texto inicial')
+    queryClient.setQueryData(pageKey, (page: Page) => ({
+      ...page,
+      layers: page.layers.map((layer) =>
+        layer.id === 'element' && layer.type === 'text'
+          ? {
+              ...layer,
+              content: {
+                ...layer.content,
+                translation: { text: 'Server refresh', language: null },
+              },
+            }
+          : layer,
+      ),
+    }))
+    expect(translation).toHaveFocus()
+    expect(translation).toHaveValue('Texto inicial')
+
+    fireEvent.change(translation, { target: { value: 'Texto inicial continuado' } })
+    await waitFor(() =>
+      expect(save).toHaveBeenLastCalledWith('element', 'Texto inicial continuado', session),
+    )
+    expect(translation).toHaveFocus()
+    expect(translation).toHaveValue('Texto inicial continuado')
+  })
+
   it('shows actual layers with only the useful text-role distinction', () => {
     installProject()
     queryClient.setQueryData(pageKey, (page: { layers: Layer[] }) => ({
@@ -1569,6 +1939,7 @@ describe('greenfield editor', () => {
         nextPreferences.pipeline,
         preferences.providers,
         preferences.typesetting,
+        preferences.view,
       ),
     )
     expect(
@@ -1599,7 +1970,7 @@ describe('greenfield editor', () => {
         typesetting,
       }))
     render(
-      <ThemeProvider attribute='class'>
+      <ThemeProvider>
         <SettingsNavigationHarness />
       </ThemeProvider>,
     )
@@ -1690,6 +2061,7 @@ describe('greenfield editor', () => {
         nextPreferences.pipeline,
         currentPreferences.providers,
         currentPreferences.typesetting,
+        currentPreferences.view,
       ),
     )
     expect(useNorrixStore.getState().preferences?.pipeline.translation).toEqual(
@@ -1745,6 +2117,7 @@ describe('greenfield editor', () => {
         nextPreferences.pipeline,
         preferences.providers,
         preferences.typesetting,
+        preferences.view,
       ),
     )
     expect(useNorrixStore.getState().preferences?.pipeline.translation).toEqual(
@@ -1789,7 +2162,7 @@ describe('greenfield editor', () => {
     useNorrixStore.setState({ settingsOpen: true })
     const save = vi.spyOn(commands, 'savePreferences').mockResolvedValue(preferences)
     render(
-      <ThemeProvider attribute='class'>
+      <ThemeProvider>
         <SettingsPage />
       </ThemeProvider>,
     )
@@ -1809,6 +2182,7 @@ describe('greenfield editor', () => {
         }),
         preferences.providers,
         preferences.typesetting,
+        preferences.view,
       ),
     )
     fireEvent.click(screen.getByRole('button', { name: 'Providers' }))
@@ -1837,6 +2211,7 @@ describe('greenfield editor', () => {
         }),
         preferences.providers,
         preferences.typesetting,
+        preferences.view,
       ),
     )
     const vision = screen.getByRole('switch', { name: 'Vision' })
@@ -1853,6 +2228,7 @@ describe('greenfield editor', () => {
         }),
         preferences.providers,
         preferences.typesetting,
+        preferences.view,
       ),
     )
     expect(screen.getByLabelText('Translation model')).toHaveTextContent('Gemma 4 E2B Instruct')
@@ -1913,7 +2289,7 @@ describe('greenfield editor', () => {
     })
     const save = vi.spyOn(commands, 'savePreferences').mockResolvedValue(configured)
     render(
-      <ThemeProvider attribute='class'>
+      <ThemeProvider>
         <SettingsPage />
       </ThemeProvider>,
     )
@@ -1935,6 +2311,7 @@ describe('greenfield editor', () => {
         }),
         configured.providers,
         configured.typesetting,
+        configured.view,
       ),
     )
   })
@@ -2002,7 +2379,7 @@ describe('greenfield editor', () => {
         typesetting,
       }))
     render(
-      <ThemeProvider attribute='class'>
+      <ThemeProvider>
         <SettingsPage />
       </ThemeProvider>,
     )
@@ -2024,7 +2401,7 @@ describe('greenfield editor', () => {
     useNorrixStore.setState({ settingsOpen: true })
     const save = vi.spyOn(commands, 'savePreferences').mockResolvedValue(preferences)
     render(
-      <ThemeProvider attribute='class'>
+      <ThemeProvider>
         <SettingsPage />
       </ThemeProvider>,
     )
@@ -2042,6 +2419,7 @@ describe('greenfield editor', () => {
         }),
         preferences.providers,
         preferences.typesetting,
+        preferences.view,
       ),
     )
   })
@@ -2094,7 +2472,7 @@ describe('greenfield editor', () => {
         return saved
       })
     render(
-      <ThemeProvider attribute='class'>
+      <ThemeProvider>
         <SettingsPage />
       </ThemeProvider>,
     )
@@ -2177,7 +2555,7 @@ describe('greenfield editor', () => {
         typesetting,
       }))
     render(
-      <ThemeProvider attribute='class'>
+      <ThemeProvider>
         <SettingsPage />
       </ThemeProvider>,
     )
@@ -2188,15 +2566,21 @@ describe('greenfield editor', () => {
     await user.click(await screen.findByRole('option', { name: 'Arial, System' }))
 
     await waitFor(() =>
-      expect(save).toHaveBeenLastCalledWith(preferences.pipeline, preferences.providers, {
-        font_families: ['Noto Sans', 'Arial'],
-      }),
+      expect(save).toHaveBeenLastCalledWith(
+        preferences.pipeline,
+        preferences.providers,
+        { font_families: ['Noto Sans', 'Arial'] },
+        preferences.view,
+      ),
     )
     await user.click(screen.getByRole('button', { name: 'Remove Noto Sans' }))
     await waitFor(() =>
-      expect(save).toHaveBeenLastCalledWith(preferences.pipeline, preferences.providers, {
-        font_families: ['Arial'],
-      }),
+      expect(save).toHaveBeenLastCalledWith(
+        preferences.pipeline,
+        preferences.providers,
+        { font_families: ['Arial'] },
+        preferences.view,
+      ),
     )
   })
 
@@ -2268,10 +2652,17 @@ describe('greenfield editor', () => {
           id: 'job',
           completed: 1,
           total: 4,
+          skipped: 1,
+          failed: 1,
           page: 'page',
           stage: 'ocr',
           model: 'manga-ocr',
           error: null,
+          rotation_failures: [],
+          rotation_successful_key: null,
+          rotation_using_key: null,
+          rotation_keys_left: [],
+          rotation_exhausted: false,
         },
       },
     })
@@ -2289,11 +2680,75 @@ describe('greenfield editor', () => {
     const stop = vi.spyOn(commands, 'stopJob').mockResolvedValue(null)
     render(<ActivityCenter />)
     expect(screen.getByText('25%')).toBeInTheDocument()
+    expect(screen.getByText('1 skipped · 1 failed')).toBeInTheDocument()
     // Separate elements, so a long label truncates without taking the model.
     expect(screen.getByText('Page 1: cover.png')).toBeInTheDocument()
     expect(screen.getByText('manga-ocr')).toBeInTheDocument()
     fireEvent.click(screen.getByRole('button', { name: 'Stop' }))
     await waitFor(() => expect(stop).toHaveBeenCalledWith('job'))
+  })
+
+  it('shows completed and cancelled pipeline outcomes', () => {
+    useNorrixStore.setState({
+      jobs: {
+        complete: {
+          state: 'finished',
+          id: 'complete',
+          completed: 4,
+          total: 4,
+          skipped: 1,
+          failed: 0,
+          page: 'page',
+          stage: 'translation',
+          model: null,
+          error: null,
+          rotation_failures: [],
+          rotation_successful_key: null,
+          rotation_using_key: null,
+          rotation_keys_left: [],
+          rotation_exhausted: false,
+        },
+        cancelled: {
+          state: 'stopped',
+          id: 'cancelled',
+          completed: 2,
+          total: 4,
+          skipped: 0,
+          failed: 0,
+          page: 'page',
+          stage: 'ocr',
+          model: null,
+          error: null,
+          rotation_failures: [],
+          rotation_successful_key: null,
+          rotation_using_key: null,
+          rotation_keys_left: [],
+          rotation_exhausted: false,
+        },
+        failed: {
+          state: 'failed',
+          id: 'failed',
+          completed: 3,
+          total: 4,
+          skipped: 1,
+          failed: 1,
+          page: 'page',
+          stage: 'translation',
+          model: null,
+          error: 'Translation request failed.',
+          rotation_failures: [],
+          rotation_successful_key: null,
+          rotation_using_key: null,
+          rotation_keys_left: [],
+          rotation_exhausted: false,
+        },
+      },
+    })
+    render(<ActivityCenter />)
+
+    expect(screen.getByText('Processing complete.')).toBeInTheDocument()
+    expect(screen.getByText('Processing was cancelled.')).toBeInTheDocument()
+    expect(screen.getByText('Translation request failed.')).toBeInTheDocument()
   })
 
   it('combines concurrent downloads into one progress bar', () => {

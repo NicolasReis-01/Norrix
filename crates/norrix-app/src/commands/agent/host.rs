@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use norrix_agent::{Control, Host, Invocation, Tool, ToolCall};
 use norrix_desktop::{Desktop, Frame};
-use norrix_pipeline::{Committer, Operation, RunStatus, Scope, Stage, StageOutput, StopToken};
-use norrix_scene::{Commit, EntityId, Snapshot};
+use norrix_pipeline::{
+    CommitResult, Committer, Operation, RunStatus, Scope, Stage, StageOutput, StopToken,
+};
+use norrix_scene::{Commit, EntityId};
 use schemars::{JsonSchema, schema_for};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -144,7 +146,20 @@ impl NorrixHost {
             let stop = stop.clone();
             async move {
                 control.cancelled().await;
-                stop.stop();
+                tracing::info!(
+                    target: "norrix_metrics",
+                    event = "pipeline_job_cancellation_requested",
+                    job_id = %job,
+                    cancellation_reason = "agent_control_cancelled",
+                    result = "requested",
+                );
+                tracing::info!(
+                    event = "pipeline_job_cancellation_requested",
+                    job_id = %job,
+                    cancellation_reason = "agent_control_cancelled",
+                    result = "requested",
+                );
+                stop.stop_with_reason("agent_control_cancelled");
             }
         });
         let mut committer = AgentCommitter { host: self.clone() };
@@ -464,20 +479,20 @@ struct AgentCommitter {
 
 #[async_trait]
 impl Committer for AgentCommitter {
-    async fn commit(&mut self, output: StageOutput) -> Result<Snapshot> {
+    async fn commit(&mut self, output: StageOutput) -> Result<CommitResult> {
         let (commit, page) = {
             let current = self.host.handle.state::<CurrentProject>();
             let mut current = current.project.lock().await;
             let project = current.as_mut().context("no project is open")?;
             let Some(commit) = project.commit_rebased(output.patch).await? else {
-                return Ok(project.snapshot());
+                return Ok(CommitResult::Conflict);
             };
             project.record_commit(&commit);
             (commit, project.active_page())
         };
         let snapshot = commit.snapshot.clone();
         self.host.synchronize(commit, page).await?;
-        Ok(snapshot)
+        Ok(CommitResult::Applied(snapshot))
     }
 }
 

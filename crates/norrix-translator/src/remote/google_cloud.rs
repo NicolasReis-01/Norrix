@@ -5,7 +5,6 @@ use anyhow::Context;
 use norrix_secrets::ExposeSecret;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use url::Url;
 
 use super::send_json;
 use crate::{Model, Provider, Result, TranslationRequest};
@@ -36,17 +35,18 @@ pub(super) async fn translate(
 ) -> Result<Vec<String>> {
     let api_key = norrix_secrets::get("google-cloud-translation")?
         .context("google-cloud-translation API key is not configured")?;
-    let mut url = Url::parse(URL).expect("Google API URL is valid");
-    url.query_pairs_mut()
-        .append_pair("key", api_key.expose_secret());
     let response: Response = send_json(
         "google-cloud-translation",
-        client.post(url).json(&Request {
-            q: &request.segments,
-            target: request.target_language.tag(),
-            source: request.source_language.map(|language| language.tag()),
-            format: "text",
-        }),
+        translation_request(
+            client,
+            api_key.expose_secret(),
+            &Request {
+                q: &request.segments,
+                target: request.target_language.tag(),
+                source: request.source_language.map(|language| language.tag()),
+                format: "text",
+            },
+        ),
     )
     .await?;
     Ok(response
@@ -55,6 +55,17 @@ pub(super) async fn translate(
         .into_iter()
         .map(|translation| translation.translated_text)
         .collect())
+}
+
+fn translation_request<'a>(
+    client: &Client,
+    api_key: &str,
+    request: &Request<'a>,
+) -> reqwest::RequestBuilder {
+    client
+        .post(URL)
+        .header("x-goog-api-key", api_key)
+        .json(request)
 }
 
 #[derive(Serialize)]
@@ -80,4 +91,34 @@ struct Data {
 struct Translation {
     #[serde(rename = "translatedText")]
     translated_text: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sends_api_key_in_header_not_url() {
+        let request = translation_request(
+            &Client::new(),
+            "test-key",
+            &Request {
+                q: &[],
+                target: "ja",
+                source: None,
+                format: "text",
+            },
+        )
+        .build()
+        .unwrap();
+
+        assert_eq!(request.url().query(), None);
+        assert_eq!(
+            request
+                .headers()
+                .get("x-goog-api-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("test-key")
+        );
+    }
 }

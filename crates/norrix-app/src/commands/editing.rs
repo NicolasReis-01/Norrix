@@ -141,19 +141,23 @@ pub(crate) async fn set_source_text(
     project: State<'_, CurrentProject>,
     canvas_channel: State<'_, CanvasChannel>,
 ) -> Result<(), Error> {
-    let (commit, page) = {
+    let (commit, page, synchronize) = {
         let mut project = project.project.lock().await;
         let project = project.as_mut().context("no project is open")?;
+        let page = project.page_for_layer(layer)?;
+        let synchronize = edit_session.is_none();
         let commit = project.set_source_text(layer, text).await?;
         if let Some(session) = edit_session {
             project.record_text_edit_commit(&commit, session);
         } else {
             project.record_commit(&commit);
         }
-        (commit, project.active_page())
+        (commit, Some(page), synchronize)
     };
-    let canvas = synchronize_canvas(&desktop, &commit, page).await?;
-    canvas_channel.channel.publish(canvas);
+    if synchronize {
+        let canvas = synchronize_canvas(&desktop, &commit, page).await?;
+        canvas_channel.channel.publish(canvas);
+    }
     Ok(())
 }
 
@@ -177,19 +181,23 @@ pub(crate) async fn set_translation(
     project: State<'_, CurrentProject>,
     canvas_channel: State<'_, CanvasChannel>,
 ) -> Result<(), Error> {
-    let (commit, page) = {
+    let (commit, page, synchronize) = {
         let mut project = project.project.lock().await;
         let project = project.as_mut().context("no project is open")?;
+        let page = project.page_for_layer(layer)?;
+        let synchronize = edit_session.is_none();
         let commit = project.set_translation(layer, text).await?;
         if let Some(session) = edit_session {
             project.record_text_edit_commit(&commit, session);
         } else {
             project.record_commit(&commit);
         }
-        (commit, project.active_page())
+        (commit, Some(page), synchronize)
     };
-    let canvas = synchronize_canvas(&desktop, &commit, page).await?;
-    canvas_channel.channel.publish(canvas);
+    if synchronize {
+        let canvas = synchronize_canvas(&desktop, &commit, page).await?;
+        canvas_channel.channel.publish(canvas);
+    }
     Ok(())
 }
 
@@ -400,6 +408,31 @@ pub(crate) async fn redo(
         let project = project.as_mut().context("no project is open")?;
         let commit = project.redo().await?;
         project.reconcile_page();
+        (commit, project.active_page())
+    };
+    let canvas = synchronize_canvas(&desktop, &commit, page).await?;
+    canvas_channel.channel.publish(canvas);
+    Ok(())
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) async fn set_progress_markers(
+    pages: Vec<EntityId>,
+    text_layer: Option<EntityId>,
+    kind: norrix_scene::ProgressKind,
+    completed: bool,
+    desktop: State<'_, Desktop>,
+    project: State<'_, CurrentProject>,
+    canvas_channel: State<'_, CanvasChannel>,
+) -> Result<(), Error> {
+    let (commit, page) = {
+        let mut project = project.project.lock().await;
+        let project = project.as_mut().context("no project is open")?;
+        let commit = project
+            .set_progress_markers(pages, text_layer, kind, completed)
+            .await?;
+        project.record_commit(&commit);
         (commit, project.active_page())
     };
     let canvas = synchronize_canvas(&desktop, &commit, page).await?;

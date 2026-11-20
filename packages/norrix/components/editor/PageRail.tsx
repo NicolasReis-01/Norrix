@@ -5,13 +5,14 @@ import { observeElementRect, useVirtualizer } from '@tanstack/react-virtual'
 import {
   FilePlus2,
   FolderOpen,
+  Languages,
   LoaderCircle,
   MoreHorizontal,
   Search,
   Settings,
   Trash2,
 } from 'lucide-react'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 import { ResourceMonitor } from '@/components/editor/ResourceMonitor'
@@ -27,8 +28,8 @@ import {
   usePages,
   useWorkspacePage,
 } from '@/lib/queries'
-import { useNorrixStore } from '@/lib/store'
-import { prefetchCanvasPages, showCanvasPage } from '@norrix/bridge/canvas'
+import { receiveError, useNorrixStore } from '@/lib/store'
+import { prefetchCanvasPages, showCanvasPage, traceCanvas } from '@norrix/bridge/canvas'
 import {
   commands,
   type CanvasPagePreparation,
@@ -76,6 +77,7 @@ export function PageRail() {
   const setActivePage = useNorrixStore((state) => state.selectPage)
   const navigateToPage = useNorrixStore((state) => state.navigateToPage)
   const workspaceMode = useNorrixStore((state) => state.workspaceMode)
+  const selectedPage = useNorrixStore((state) => state.selectedPage)
   const setSettingsOpen = useNorrixStore((state) => state.setSettingsOpen)
   const { importPages, importing } = useImportPages()
   const anchor = useRef<number | null>(null)
@@ -94,6 +96,10 @@ export function PageRail() {
     [normalized, pages],
   )
   const pageList = useRef<HTMLDivElement>(null)
+  const setPageList = useCallback((element: HTMLDivElement | null) => {
+    pageList.current = element
+    element?.setAttribute('data-norrix-page-rail-viewport', '')
+  }, [])
   const pageVirtualizer = useVirtualizer({
     count: visiblePages.length,
     getScrollElement: () => pageList.current,
@@ -107,17 +113,71 @@ export function PageRail() {
         callback({ width: rect.width || 240, height: rect.height || 600 }),
       ),
   })
+  const activePage = workspaceMode === 'infinite' ? selectedPage : active
+  const activeIndex = visiblePages.findIndex(({ page }) => page.id === activePage)
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    traceCanvas('page-rail-active-page-updated', {
+      operation: 'PageRail.activePage',
+      page: activePage,
+      index: activeIndex,
+      scrollTop: pageList.current?.scrollTop ?? null,
+      result: workspaceMode === 'infinite' ? 'following-canvas-viewport' : 'active-page-updated',
+      reason:
+        workspaceMode === 'infinite'
+          ? 'PageRail follows the active canvas page in Infinite Scroll'
+          : null,
+    })
+    if (workspaceMode !== 'infinite' || activeIndex < 0) return
+    const viewport = pageList.current
+    const previousScrollTop = viewport?.scrollTop ?? null
+    pageVirtualizer.scrollToIndex(activeIndex, { align: 'auto' })
+    traceCanvas('page-rail-followed-canvas-page', {
+      operation: 'PageRail.scrollToIndex',
+      page: activePage,
+      index: activeIndex,
+      previousScrollTop,
+      scrollTop: viewport?.scrollTop ?? null,
+      result: 'synchronized',
+      reason: 'active page changed with the Infinite Scroll canvas viewport',
+    })
+  }, [activeIndex, activePage, pageVirtualizer, workspaceMode])
+
+  useEffect(() => {
+    const viewport = pageList.current
+    const current = useNorrixStore.getState()
+    traceCanvas('page-rail-mounted', {
+      operation: 'PageRail.lifecycle',
+      page: current.selectedPage,
+      revision: current.canvasRevision,
+      generation: current.canvasGeneration,
+      scrollTop: viewport?.scrollTop ?? null,
+      result: 'mounted',
+    })
+    return () => {
+      const latest = useNorrixStore.getState()
+      traceCanvas('page-rail-unmounted', {
+        operation: 'PageRail.lifecycle',
+        page: latest.selectedPage,
+        revision: latest.canvasRevision,
+        generation: latest.canvasGeneration,
+        scrollTop: viewport?.scrollTop ?? null,
+        result: 'unmounted',
+        reason: 'React component cleanup',
+      })
       selectionRequest.current += 1
-    },
-    [],
-  )
+    }
+  }, [])
 
   const select = (index: number, additive: boolean, range: boolean) => {
     const page = pages[index]
     if (!page) return
+    traceCanvas('page-rail-navigation-requested', {
+      operation: 'PageRail.userSelection',
+      page: page.id,
+      scrollTop: pageList.current?.scrollTop ?? null,
+      result: 'user-initiated',
+    })
     let next: string[]
     if (range && anchor.current !== null) {
       const start = Math.min(anchor.current, index)
@@ -289,7 +349,7 @@ export function PageRail() {
           <ScrollArea
             className='min-h-0 flex-1'
             viewportClassName='px-1.5 py-1.5'
-            viewportRef={pageList}
+            viewportRef={setPageList}
           >
             <div className='relative w-full' style={{ height: pageVirtualizer.getTotalSize() }}>
               {pageVirtualizer.getVirtualItems().map((virtualRow) => {
@@ -305,15 +365,30 @@ export function PageRail() {
                   >
                     <PageItem
                       page={page}
-                      active={active === page.id}
+                      active={activePage === page.id}
                       selected={selected.includes(page.id)}
                       dragged={dragged === page.id}
-                      onIntent={active === page.id ? undefined : () => prefetchOnIntent(page.id)}
+                      onIntent={
+                        activePage === page.id ? undefined : () => prefetchOnIntent(page.id)
+                      }
                       onSelect={(additive, range) => select(index, additive, range)}
                       onDragStart={() => setDragged(page.id)}
                       onDragEnd={() => setDragged(null)}
                       onRename={() => openRename(page)}
                       onDelete={() => deletePage(page.id)}
+                      onToggleTranslation={() =>
+                        void call(
+                          commands.setProgressMarkers,
+                          [page.id],
+                          null,
+                          'translation',
+                          !page.translation_complete,
+                        )
+                          .then(() => refresh(projectKey, pagesKey, pageKey))
+                          .catch((error: unknown) =>
+                            receiveError(error instanceof Error ? error.message : String(error)),
+                          )
+                      }
                       onDrop={() => {
                         if (dragged && dragged !== page.id) {
                           void call(commands.movePage, dragged, index)
@@ -457,6 +532,7 @@ function PageItem({
   onDragEnd,
   onRename,
   onDelete,
+  onToggleTranslation,
   onDrop,
 }: {
   page: PageSummary
@@ -469,6 +545,7 @@ function PageItem({
   onDragEnd: () => void
   onRename: () => void
   onDelete: () => void
+  onToggleTranslation: () => void
   onDrop: () => void
 }) {
   const { t } = useTranslation()
@@ -537,11 +614,56 @@ function PageItem({
         <p className='mt-1 text-[9px] leading-3.5 text-muted-foreground'>
           {t('navigator.layerCount', { count: page.layer_count })}
         </p>
+        <div className='mt-1 flex items-center gap-1' aria-label={t('progress.pageSummary')}>
+          <ProgressBadge label='DTC' active={page.detection_complete} />
+          <ProgressBadge label='OCR' active={page.ocr_complete} />
+          <ProgressBadge
+            label={`TRD ${page.translated_texts}/${page.total_texts}`}
+            active={page.translated_texts > 0 || page.translation_complete}
+          />
+          <ProgressBadge label='PRE' active={page.inpainting_complete} />
+          <Button
+            type='button'
+            variant='ghost'
+            size='icon-xs'
+            className='ml-auto size-4 text-muted-foreground hover:text-foreground'
+            aria-label={
+              page.translation_complete
+                ? t('navigator.markTranslationPending', {
+                    defaultValue: 'Mark translation as pending',
+                  })
+                : t('navigator.markTranslationComplete', {
+                    defaultValue: 'Mark page as translated',
+                  })
+            }
+            title={
+              page.translation_complete
+                ? t('navigator.markTranslationPending', {
+                    defaultValue: 'Mark translation as pending',
+                  })
+                : t('navigator.markTranslationComplete', {
+                    defaultValue: 'Mark page as translated',
+                  })
+            }
+            onClick={onToggleTranslation}
+          >
+            <Languages />
+          </Button>
+        </div>
         <p className='mt-1 text-[9px] text-muted-foreground tabular-nums'>
           {page.size.width} × {page.size.height}
         </p>
       </div>
     </article>
+  )
+}
+
+function ProgressBadge({ label, active }: { label: string; active: boolean }) {
+  if (!active) return null
+  return (
+    <span className='rounded-sm bg-[#ffac80]/10 px-1 text-[8px] leading-3 text-[#ffac80] tabular-nums'>
+      {label}
+    </span>
   )
 }
 

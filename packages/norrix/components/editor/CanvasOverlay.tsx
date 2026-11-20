@@ -85,6 +85,9 @@ export function CanvasOverlay({
   )
   const typographyPreview = useNorrixStore((state) => state.typographyPreview)
   const layerFontSizes = useNorrixStore((state) => state.layerFontSizes)
+  const viewPreferences = useNorrixStore((state) => state.preferences?.view)
+  const showTextBoxOutlines = viewPreferences?.text_box_outlines ?? false
+  const detectionOutlineMode = viewPreferences?.detection_outlines ?? 'selected'
   const selectedIds = useMemo(() => new Set(expandedSelection), [expandedSelection])
   const multipleSelected = expandedSelection.length > 1
   const layers = useMemo(
@@ -110,6 +113,12 @@ export function CanvasOverlay({
     : editing
       ? undefined
       : layers.find(({ layer }) => selectedIds.has(layer.id) && selectableLayer(layer))
+  const detectionOutlines =
+    detectionOutlineMode === 'always'
+      ? page.regions.map(({ id, geometry }) => ({ id, geometry }))
+      : detectionOutlineMode === 'selected' && selectedTextLayer && automaticRegion
+        ? [{ id: automaticRegion.id, geometry: automaticRegion.geometry }]
+        : []
   const scale = camera.zoom / window.devicePixelRatio
 
   return (
@@ -119,9 +128,9 @@ export function CanvasOverlay({
       className='pointer-events-none absolute inset-0 overflow-hidden'
       aria-hidden={!editing}
     >
-      {automaticRegion && (
-        <AutomaticRegionOverlay geometry={automaticRegion.geometry} camera={camera} />
-      )}
+      {detectionOutlines.map(({ id, geometry }) => (
+        <AutomaticRegionOverlay key={id} geometry={geometry} camera={camera} />
+      ))}
       {layers.map(({ layer, frame, opacity }) => {
         const position = cssFrame(frame, camera)
         const selected = selectedIds.has(layer.id) && selectableLayer(layer)
@@ -139,9 +148,10 @@ export function CanvasOverlay({
         const originalFrame = controlFrame(layer, frames)
         const resizing =
           isTextLayer(layer) &&
+          layer.typography?.auto_fit !== false &&
           originalFrame !== null &&
-          (Math.abs(frame.width - originalFrame.width) > 0.01 ||
-            Math.abs(frame.height - originalFrame.height) > 0.01)
+          Math.abs(frame.width - originalFrame.width) > 0.01 &&
+          Math.abs(frame.height - originalFrame.height) > 0.01
         const resizedFontSize =
           resizing && isTextLayer(layer)
             ? previewFontSizeForFrame(layer, frame.width, frame.height)
@@ -162,7 +172,9 @@ export function CanvasOverlay({
                 transform: `rotate(${position.angle}deg)`,
                 transformOrigin: '50% 50%',
                 border:
-                  highlighted || (selected && multipleSelected)
+                  (showTextBoxOutlines && isTextLayer(layer)) ||
+                  highlighted ||
+                  (selected && multipleSelected)
                     ? '1px solid var(--canvas-selection)'
                     : undefined,
                 opacity,
@@ -603,7 +615,7 @@ function InlineTextEditor({
             y={rect.y}
             width={rect.width}
             height={rect.height}
-            fill='var(--canvas-selection)'
+            fill='#2563eb'
             fillOpacity={0.32}
           />
         ))}

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     io::Cursor,
     path::{Path, PathBuf},
 };
@@ -8,12 +8,13 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use image::{DynamicImage, ImageFormat, RgbaImage};
 use norrix_desktop::Frame;
 use norrix_scene::{
-    AssetInput, AssetMetadata, AssetRole, At, Authored, Commit, EntityId, EntityOrigin,
-    Geometry as SceneGeometry, Group as SceneGroup, Origin, PageDraft, Point as ScenePoint,
-    Presents, RasterLayer as SceneRasterLayer, RasterLayerKind, Region as SceneRegion,
-    RemovePolicy, Revision, Session, Snapshot, SourceText as SceneSourceText,
-    TextGroup as SceneTextGroup, TextLayout as SceneTextLayout, TextLayoutKind,
-    Translation as SceneTranslation, Typography as SceneTypography, Visibility as SceneVisibility,
+    AssetInput, AssetMetadata, AssetRole, At, Authored, Commit, Edit as SceneEdit, EntityId,
+    EntityOrigin, Geometry as SceneGeometry, Group as SceneGroup, Origin, PageDraft,
+    PipelineProgress, Point as ScenePoint, Presents, ProgressKind, ProgressOrigin, ProgressStatus,
+    RasterLayer as SceneRasterLayer, RasterLayerKind, Region as SceneRegion, RemovePolicy,
+    Revision, Session, Snapshot, SourceText as SceneSourceText, TextGroup as SceneTextGroup,
+    TextLayout as SceneTextLayout, TextLayoutKind, Translation as SceneTranslation,
+    Typography as SceneTypography, Visibility as SceneVisibility,
 };
 use serde::Serialize;
 use specta::Type;
@@ -58,6 +59,14 @@ pub struct PageSummary {
     pub source_asset: Option<String>,
     #[specta(type = f64)]
     pub layer_count: usize,
+    pub detection_complete: bool,
+    pub ocr_complete: bool,
+    pub translation_complete: bool,
+    pub inpainting_complete: bool,
+    #[specta(type = f64)]
+    pub translated_texts: usize,
+    #[specta(type = f64)]
+    pub total_texts: usize,
 }
 
 #[derive(Clone, Debug, Serialize, Type)]
@@ -125,6 +134,7 @@ pub struct TextContent {
     pub id: EntityId,
     pub source: Option<SourceText>,
     pub translation: Option<Translation>,
+    pub translation_complete: bool,
     pub role: Option<String>,
     pub source_region: Option<EntityId>,
 }
@@ -237,12 +247,33 @@ impl ProjectLibrary {
     }
 
     pub(crate) fn delete(&self, name: &str) -> Result<()> {
-        let (_, path) = self.resolve(name)?;
-        if !path.is_dir() {
+        let (name, current) = self.resolve(name)?;
+        let legacy = self.legacy_root.join(format!("{name}.khrproj"));
+        let mut removed = false;
+
+        for path in [current, legacy] {
+            if !path
+                .try_exists()
+                .with_context(|| format!("failed to inspect {}", path.display()))?
+            {
+                continue;
+            }
+            let metadata = std::fs::symlink_metadata(&path)
+                .with_context(|| format!("failed to inspect {}", path.display()))?;
+            if metadata.file_type().is_dir() {
+                std::fs::remove_dir_all(&path)
+                    .with_context(|| format!("failed to delete {}", path.display()))?;
+            } else {
+                std::fs::remove_file(&path)
+                    .with_context(|| format!("failed to delete {}", path.display()))?;
+            }
+            removed = true;
+        }
+
+        if !removed {
             bail!("project {name:?} does not exist");
         }
-        std::fs::remove_dir_all(&path)
-            .with_context(|| format!("failed to delete {}", path.display()))
+        Ok(())
     }
 
     fn resolve(&self, name: &str) -> Result<(String, PathBuf)> {
@@ -430,6 +461,20 @@ impl Project {
         self.active_page
     }
 
+    pub(crate) fn page_for_layer(&self, layer: EntityId) -> Result<EntityId> {
+        let snapshot = self.snapshot();
+        snapshot.text_layer(layer)?;
+        let mut current = layer;
+        loop {
+            if snapshot.page(current).is_ok() {
+                return Ok(current);
+            }
+            current = snapshot
+                .parent(current)?
+                .context("text layer is not attached to a page")?;
+        }
+    }
+
     pub(crate) fn select_page(&mut self, page: EntityId) -> Result<()> {
         self.snapshot().page(page)?;
         self.active_page = Some(page);
@@ -470,6 +515,16 @@ impl Project {
                     .filter(|present| *present)
                     .count()
                     + usize::from(source_asset.is_some());
+                let progress = snapshot
+                    .component::<PipelineProgress>(page.id())?
+                    .unwrap_or_default();
+                let (translated_texts, total_texts) =
+                    Self::translation_progress(snapshot, page.id())?;
+                let translation_complete = if total_texts > 0 {
+                    translated_texts == total_texts
+                } else {
+                    progress.is_complete(ProgressKind::Translation)
+                };
                 Ok(PageSummary {
                     id: page.id(),
                     label: value.label,
@@ -479,9 +534,230 @@ impl Project {
                     },
                     source_asset,
                     layer_count,
+                    detection_complete: progress.is_complete(ProgressKind::Detection),
+                    ocr_complete: progress.is_complete(ProgressKind::Ocr),
+                    translation_complete,
+                    inpainting_complete: progress.is_complete(ProgressKind::Inpainting),
+                    translated_texts,
+                    total_texts,
                 })
             })
             .collect()
+    }
+
+    pub(crate) async fn set_progress_markers(
+        &mut self,
+        pages: Vec<EntityId>,
+        text_layer: Option<EntityId>,
+        kind: ProgressKind,
+        completed: bool,
+    ) -> Result<Commit> {
+        let snapshot = self.snapshot();
+        let patch = match kind {
+            ProgressKind::Translation => match (pages.is_empty(), text_layer) {
+                (true, Some(layer)) => {
+                    let content = Self::text_content(&snapshot, layer)?;
+                    let page = self.page_for_layer(layer)?;
+                    snapshot.patch(|edit| {
+                        let mut progress = snapshot
+                            .component::<PipelineProgress>(content)?
+                            .unwrap_or_default();
+                        progress.set(
+                            kind,
+                            Some(if completed {
+                                ProgressStatus::Complete(ProgressOrigin::Manual)
+                            } else {
+                                ProgressStatus::Pending(ProgressOrigin::Manual)
+                            }),
+                        );
+                        edit.set(content, &progress)?;
+                        Self::clear_page_translation_marker(&snapshot, edit, page)?;
+                        if !completed {
+                            Self::invalidate_fill_for_page(&snapshot, edit, page)?;
+                        }
+                        Ok(())
+                    })?
+                }
+                (false, None) => {
+                    let pages = pages.into_iter().collect::<BTreeSet<_>>();
+                    for page in &pages {
+                        snapshot.page(*page)?;
+                    }
+                    snapshot.patch(|edit| {
+                        for page in pages {
+                            let mut contents = Vec::new();
+                            if let Some(group) = snapshot.page(page)?.text_group()? {
+                                for layer in group.text_layers()? {
+                                    contents.push(layer.content()?.id());
+                                }
+                            }
+                            if contents.is_empty() {
+                                let mut progress = snapshot
+                                    .component::<PipelineProgress>(page)?
+                                    .unwrap_or_default();
+                                progress.set(
+                                    kind,
+                                    Some(if completed {
+                                        ProgressStatus::Complete(ProgressOrigin::Manual)
+                                    } else {
+                                        ProgressStatus::Pending(ProgressOrigin::Manual)
+                                    }),
+                                );
+                                edit.set(page, &progress)?;
+                            } else {
+                                for content in contents {
+                                    let mut progress = snapshot
+                                        .component::<PipelineProgress>(content)?
+                                        .unwrap_or_default();
+                                    progress.set(
+                                        kind,
+                                        Some(if completed {
+                                            ProgressStatus::Complete(ProgressOrigin::Manual)
+                                        } else {
+                                            ProgressStatus::Pending(ProgressOrigin::Manual)
+                                        }),
+                                    );
+                                    edit.set(content, &progress)?;
+                                }
+                                Self::clear_page_translation_marker(&snapshot, edit, page)?;
+                            }
+                        }
+                        Ok(())
+                    })?
+                }
+                _ => bail!("select either one or more pages or one text box"),
+            },
+            ProgressKind::Detection | ProgressKind::Ocr | ProgressKind::Inpainting => {
+                if text_layer.is_some() || pages.is_empty() {
+                    bail!("select one or more pages to change page progress");
+                }
+
+                let pages = pages.into_iter().collect::<BTreeSet<_>>();
+                for page in &pages {
+                    snapshot.page(*page)?;
+                }
+                snapshot.patch(|edit| {
+                    for page in pages {
+                        let mut progress = snapshot
+                            .component::<PipelineProgress>(page)?
+                            .unwrap_or_default();
+                        progress.set(
+                            kind,
+                            completed.then_some(ProgressStatus::Complete(ProgressOrigin::Manual)),
+                        );
+                        if !completed {
+                            match kind {
+                                ProgressKind::Detection => {
+                                    progress.ocr = None;
+                                    progress.inpainting = None;
+                                    Self::invalidate_translations_for_page(&snapshot, edit, page)?;
+                                }
+                                ProgressKind::Ocr => {
+                                    progress.inpainting = None;
+                                    Self::invalidate_translations_for_page(&snapshot, edit, page)?;
+                                }
+                                ProgressKind::Inpainting => {}
+                                ProgressKind::Translation => unreachable!(),
+                            }
+                        }
+                        edit.set(page, &progress)?;
+                    }
+                    Ok(())
+                })?
+            }
+        };
+        self.commit(patch).await
+    }
+
+    fn clear_page_translation_marker(
+        snapshot: &Snapshot,
+        edit: &mut SceneEdit,
+        page: EntityId,
+    ) -> norrix_scene::Result<()> {
+        let mut progress = snapshot
+            .component::<PipelineProgress>(page)?
+            .unwrap_or_default();
+        if progress.status(ProgressKind::Translation).is_some() {
+            progress.set(ProgressKind::Translation, None);
+            edit.set(page, &progress)?;
+        }
+        Ok(())
+    }
+
+    fn translation_progress(snapshot: &Snapshot, page: EntityId) -> Result<(usize, usize)> {
+        let Some(group) = snapshot.page(page)?.text_group()? else {
+            return Ok((0, 0));
+        };
+        let mut completed = 0;
+        let mut total = 0;
+        for layer in group.text_layers()? {
+            let content = layer.content()?;
+            let progress = snapshot
+                .component::<PipelineProgress>(content.id())?
+                .and_then(|progress| progress.status(ProgressKind::Translation));
+            let complete = match progress {
+                Some(ProgressStatus::Complete(_)) => true,
+                Some(ProgressStatus::Pending(_)) => false,
+                None => snapshot
+                    .component::<SceneTranslation>(content.id())?
+                    .is_some_and(|translation| !translation.text.value.trim().is_empty()),
+            };
+            completed += usize::from(complete);
+            total += 1;
+        }
+        Ok((completed, total))
+    }
+
+    fn invalidate_translation_for_content(
+        snapshot: &Snapshot,
+        edit: &mut SceneEdit,
+        content: EntityId,
+    ) -> norrix_scene::Result<()> {
+        let mut progress = snapshot
+            .component::<PipelineProgress>(content)?
+            .unwrap_or_default();
+        let marked_complete = progress
+            .status(ProgressKind::Translation)
+            .is_some_and(|status| matches!(status, ProgressStatus::Complete(_)));
+        let has_translation = snapshot
+            .component::<SceneTranslation>(content)?
+            .is_some_and(|translation| !translation.text.value.trim().is_empty());
+        if marked_complete || has_translation {
+            progress.set(
+                ProgressKind::Translation,
+                Some(ProgressStatus::Pending(ProgressOrigin::Automatic)),
+            );
+            edit.set(content, &progress)?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_translations_for_page(
+        snapshot: &Snapshot,
+        edit: &mut SceneEdit,
+        page: EntityId,
+    ) -> norrix_scene::Result<()> {
+        let Some(group) = snapshot.page(page)?.text_group()? else {
+            return Ok(());
+        };
+        for layer in group.text_layers()? {
+            Self::invalidate_translation_for_content(snapshot, edit, layer.content()?.id())?;
+        }
+        Ok(())
+    }
+
+    fn invalidate_fill_for_page(
+        snapshot: &Snapshot,
+        edit: &mut SceneEdit,
+        page: EntityId,
+    ) -> norrix_scene::Result<()> {
+        let mut progress = snapshot
+            .component::<PipelineProgress>(page)?
+            .unwrap_or_default();
+        if progress.inpainting.take().is_some() {
+            edit.set(page, &progress)?;
+        }
+        Ok(())
     }
 
     pub(crate) async fn rename_page(&mut self, page: EntityId, label: String) -> Result<Commit> {
@@ -593,6 +869,7 @@ impl Project {
                     font_style: None,
                     size: None,
                     auto_fit: true,
+                    auto_fit_size: None,
                     color: None,
                     stroke_color: None,
                     stroke_width: None,
@@ -621,19 +898,25 @@ impl Project {
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let content = Self::text_content(&snapshot, layer)?;
-        let language = snapshot
-            .component::<SceneSourceText>(content)?
-            .and_then(|source| source.language);
+        let previous = snapshot.component::<SceneSourceText>(content)?;
+        let language = previous.as_ref().and_then(|source| source.language.clone());
+        let source_changed = previous.is_none_or(|source| source.text.value != text);
+        let page = self.page_for_layer(layer)?;
         let patch = snapshot.patch(|edit| {
             edit.promote_entity_to_user(layer)?;
             edit.promote_entity_to_user(content)?;
             edit.set(
                 content,
                 &SceneSourceText {
-                    text: Authored::user(text),
+                    text: Authored::user(text.clone()),
                     language,
                 },
-            )
+            )?;
+            if source_changed {
+                Self::invalidate_translation_for_content(&snapshot, edit, content)?;
+                Self::invalidate_fill_for_page(&snapshot, edit, page)?;
+            }
+            Ok(())
         })?;
         self.commit(patch).await
     }
@@ -645,22 +928,61 @@ impl Project {
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let content = Self::text_content(&snapshot, layer)?;
-        let language = snapshot
-            .component::<SceneTranslation>(content)?
-            .and_then(|translation| translation.language);
+        let previous = snapshot.component::<SceneTranslation>(content)?;
+        let language = previous
+            .as_ref()
+            .and_then(|translation| translation.language.clone());
+        let translation_changed = match (&previous, &text) {
+            (Some(previous), Some(next)) => previous.text.value != *next,
+            (Some(_), None) => true,
+            (None, Some(_)) => true,
+            (None, None) => false,
+        };
+        let translation_complete = text
+            .as_deref()
+            .is_some_and(|translation| !translation.trim().is_empty());
+        let page = self.page_for_layer(layer)?;
         let patch = snapshot.patch(|edit| {
             edit.promote_entity_to_user(layer)?;
             edit.promote_entity_to_user(content)?;
             match text {
-                Some(text) => edit.set(
-                    content,
-                    &SceneTranslation {
-                        text: Authored::user(text),
-                        language,
-                    },
-                ),
-                None => edit.remove::<SceneTranslation>(content),
+                Some(text) => {
+                    edit.set(
+                        content,
+                        &SceneTranslation {
+                            text: Authored::user(text),
+                            language,
+                        },
+                    )?;
+                    let mut progress = snapshot
+                        .component::<PipelineProgress>(content)?
+                        .unwrap_or_default();
+                    progress.set(
+                        ProgressKind::Translation,
+                        Some(if translation_complete {
+                            ProgressStatus::Complete(ProgressOrigin::Manual)
+                        } else {
+                            ProgressStatus::Pending(ProgressOrigin::Manual)
+                        }),
+                    );
+                    edit.set(content, &progress)?;
+                }
+                None => {
+                    edit.remove::<SceneTranslation>(content)?;
+                    let mut progress = snapshot
+                        .component::<PipelineProgress>(content)?
+                        .unwrap_or_default();
+                    progress.set(
+                        ProgressKind::Translation,
+                        Some(ProgressStatus::Pending(ProgressOrigin::Manual)),
+                    );
+                    edit.set(content, &progress)?;
+                }
+            };
+            if translation_changed {
+                Self::invalidate_fill_for_page(&snapshot, edit, page)?;
             }
+            Ok(())
         })?;
         self.commit(patch).await
     }
@@ -674,18 +996,21 @@ impl Project {
             .into_iter()
             .map(|update| {
                 let content = Self::text_content(&snapshot, update.layer)?;
-                Ok((update, content))
+                let page = self.page_for_layer(update.layer)?;
+                Ok((update, content, page))
             })
             .collect::<Result<Vec<_>>>()?;
         let patch = snapshot.patch(|edit| {
-            for (update, content) in updates {
+            for (update, content, page) in updates {
                 edit.promote_entity_to_user(update.layer)?;
                 edit.promote_entity_to_user(content)?;
                 match update.value {
                     TextFieldUpdate::Source(text) => {
-                        let language = snapshot
-                            .component::<SceneSourceText>(content)?
-                            .and_then(|source| source.language);
+                        let previous = snapshot.component::<SceneSourceText>(content)?;
+                        let source_changed = previous
+                            .as_ref()
+                            .is_none_or(|source| source.text.value != text);
+                        let language = previous.as_ref().and_then(|source| source.language.clone());
                         edit.set(
                             content,
                             &SceneSourceText {
@@ -693,20 +1018,61 @@ impl Project {
                                 language,
                             },
                         )?;
+                        if source_changed {
+                            Self::invalidate_translation_for_content(&snapshot, edit, content)?;
+                            Self::invalidate_fill_for_page(&snapshot, edit, page)?;
+                        }
                     }
                     TextFieldUpdate::Translation(text) => {
-                        let language = snapshot
-                            .component::<SceneTranslation>(content)?
-                            .and_then(|translation| translation.language);
+                        let previous = snapshot.component::<SceneTranslation>(content)?;
+                        let language = previous
+                            .as_ref()
+                            .and_then(|translation| translation.language.clone());
+                        let translation_complete = text
+                            .as_deref()
+                            .is_some_and(|translation| !translation.trim().is_empty());
+                        let translation_changed = match (&previous, &text) {
+                            (Some(previous), Some(next)) => previous.text.value != *next,
+                            (Some(_), None) => true,
+                            (None, Some(_)) => true,
+                            (None, None) => false,
+                        };
                         match text {
-                            Some(text) => edit.set(
-                                content,
-                                &SceneTranslation {
-                                    text: Authored::user(text),
-                                    language,
-                                },
-                            )?,
-                            None => edit.remove::<SceneTranslation>(content)?,
+                            Some(text) => {
+                                edit.set(
+                                    content,
+                                    &SceneTranslation {
+                                        text: Authored::user(text),
+                                        language,
+                                    },
+                                )?;
+                                let mut progress = snapshot
+                                    .component::<PipelineProgress>(content)?
+                                    .unwrap_or_default();
+                                progress.set(
+                                    ProgressKind::Translation,
+                                    Some(if translation_complete {
+                                        ProgressStatus::Complete(ProgressOrigin::Manual)
+                                    } else {
+                                        ProgressStatus::Pending(ProgressOrigin::Manual)
+                                    }),
+                                );
+                                edit.set(content, &progress)?;
+                            }
+                            None => {
+                                edit.remove::<SceneTranslation>(content)?;
+                                let mut progress = snapshot
+                                    .component::<PipelineProgress>(content)?
+                                    .unwrap_or_default();
+                                progress.set(
+                                    ProgressKind::Translation,
+                                    Some(ProgressStatus::Pending(ProgressOrigin::Manual)),
+                                );
+                                edit.set(content, &progress)?;
+                            }
+                        }
+                        if translation_changed {
+                            Self::invalidate_fill_for_page(&snapshot, edit, page)?;
                         }
                     }
                 }
@@ -741,6 +1107,7 @@ impl Project {
                         font_style: update.typography.font_style,
                         size: update.typography.size.filter(|size| *size > 0.0),
                         auto_fit: update.typography.auto_fit,
+                        auto_fit_size: None,
                         color: update.typography.color,
                         stroke_color: update.typography.stroke_color,
                         stroke_width: update.typography.stroke_width,
@@ -905,28 +1272,32 @@ impl Project {
 
     pub(crate) async fn set_geometries(
         &mut self,
-        geometries: impl IntoIterator<Item = (EntityId, SceneGeometry, f32, bool)>,
+        geometries: impl IntoIterator<Item = (EntityId, SceneGeometry, f32, bool, f32)>,
     ) -> Result<Commit> {
         let snapshot = self.snapshot();
         let geometries = geometries
             .into_iter()
-            .map(|(element, geometry, angle_degrees, resized)| {
-                let mut layout = snapshot
-                    .component::<SceneTextLayout>(element)?
-                    .context("only text layers can change geometry")?;
-                layout.origin = Origin::User;
-                layout.angle_degrees = Some(angle_degrees);
-                let content = Self::text_content(&snapshot, element)?;
-                let new_dimensions = geometry_dimensions(&geometry);
-                let typography = if resized {
-                    let mut typography = snapshot.component::<SceneTypography>(element)?.unwrap_or(
-                        SceneTypography {
+            .map(
+                |(element, geometry, angle_degrees, diagonal_resize, rendered_font_size)| {
+                    let mut layout = snapshot
+                        .component::<SceneTextLayout>(element)?
+                        .context("only text layers can change geometry")?;
+                    layout.origin = Origin::User;
+                    layout.angle_degrees = Some(angle_degrees);
+                    let content = Self::text_content(&snapshot, element)?;
+                    let existing_typography = snapshot.component::<SceneTypography>(element)?;
+                    let typography = if existing_typography
+                        .as_ref()
+                        .is_none_or(|typography| typography.auto_fit)
+                    {
+                        let mut typography = existing_typography.unwrap_or(SceneTypography {
                             origin: Origin::User,
                             preferred_font: None,
                             font_weight: None,
                             font_style: None,
                             size: None,
                             auto_fit: true,
+                            auto_fit_size: None,
                             color: None,
                             stroke_color: None,
                             stroke_width: None,
@@ -935,18 +1306,21 @@ impl Project {
                             line_height: None,
                             letter_spacing: None,
                             extensions: Default::default(),
-                        },
-                    );
-                    typography.origin = Origin::User;
-                    typography.auto_fit = true;
-                    typography.size = new_dimensions
-                        .map(|(width, height)| width.max(height).clamp(9.0, 512.0) as f32);
-                    Some(typography)
-                } else {
-                    None
-                };
-                Ok((element, geometry, content, layout, typography))
-            })
+                        });
+                        typography.origin = Origin::User;
+                        typography.auto_fit = true;
+                        typography.auto_fit_size = if diagonal_resize {
+                            None
+                        } else {
+                            Some(rendered_font_size)
+                        };
+                        Some(typography)
+                    } else {
+                        None
+                    };
+                    Ok((element, geometry, content, layout, typography))
+                },
+            )
             .collect::<Result<Vec<_>>>()?;
         let patch = snapshot.patch(|edit| {
             for (element, mut geometry, content, layout, typography) in geometries {
@@ -1259,6 +1633,16 @@ impl Project {
                 text: translation.text.value,
                 language: translation.language.map(|language| language.to_string()),
             });
+            let translation_progress = snapshot
+                .component::<PipelineProgress>(content.id())?
+                .and_then(|progress| progress.status(ProgressKind::Translation));
+            let translation_complete = match translation_progress {
+                Some(ProgressStatus::Complete(_)) => true,
+                Some(ProgressStatus::Pending(_)) => false,
+                None => translation
+                    .as_ref()
+                    .is_some_and(|translation| !translation.text.trim().is_empty()),
+            };
             let role = content.role()?.map(|role| role.role);
             let source_region = content.source_region()?.map(|region| region.id());
             let automatic_region = text_layer.automatic_target()?.map(|region| region.id());
@@ -1275,6 +1659,7 @@ impl Project {
                     id: content.id(),
                     source,
                     translation,
+                    translation_complete,
                     role,
                     source_region,
                 }),
@@ -1486,16 +1871,6 @@ impl Project {
     }
 }
 
-fn geometry_dimensions(geometry: &SceneGeometry) -> Option<(f64, f64)> {
-    let [top_left, top_right, bottom_right, ..] = geometry.points.as_slice() else {
-        return None;
-    };
-    Some((
-        (top_right.x - top_left.x).hypot(top_right.y - top_left.y),
-        (bottom_right.x - top_right.x).hypot(bottom_right.y - top_right.y),
-    ))
-}
-
 fn validate_project_name(name: &str) -> Result<String> {
     let name = name.trim();
     if name.is_empty() {
@@ -1595,6 +1970,439 @@ mod tests {
 
     use super::*;
 
+    #[tokio::test]
+    async fn progress_markers_follow_pages_and_text_entities_and_invalidate_dependents() {
+        let mut session = Session::memory().await.unwrap();
+        let mut edit = session.snapshot().edit();
+        let first_page = edit
+            .add_page(PageDraft::new("first", 400.0, 300.0), At::End)
+            .unwrap();
+        let second_page = edit
+            .add_page(PageDraft::new("second", 400.0, 300.0), At::End)
+            .unwrap();
+        session.commit(edit.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "progress-test".to_owned());
+
+        let (_, first_layer) = project
+            .add_point_text(first_page, Point { x: 10.0, y: 10.0 })
+            .await
+            .unwrap();
+        let (_, second_layer) = project
+            .add_point_text(first_page, Point { x: 10.0, y: 50.0 })
+            .await
+            .unwrap();
+        project
+            .set_source_text(first_layer, "first source".to_owned())
+            .await
+            .unwrap();
+        project
+            .set_source_text(second_layer, "second source".to_owned())
+            .await
+            .unwrap();
+
+        let commit = project
+            .set_progress_markers(
+                vec![first_page, second_page],
+                None,
+                ProgressKind::Detection,
+                true,
+            )
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        let commit = project
+            .set_progress_markers(
+                Vec::new(),
+                Some(first_layer),
+                ProgressKind::Translation,
+                true,
+            )
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::pages(&project.snapshot())
+                .unwrap()
+                .iter()
+                .find(|page| page.id == first_page)
+                .map(|page| (page.translated_texts, page.total_texts)),
+            Some((1, 2))
+        );
+
+        let commit = project
+            .set_translation(second_layer, Some("manual translation".to_owned()))
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        let commit = project
+            .set_progress_markers(vec![first_page], None, ProgressKind::Inpainting, true)
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::pages(&project.snapshot())
+                .unwrap()
+                .iter()
+                .find(|page| page.id == first_page)
+                .map(|page| (
+                    page.translated_texts,
+                    page.total_texts,
+                    page.inpainting_complete
+                )),
+            Some((2, 2, true))
+        );
+
+        let commit = project
+            .set_source_text(second_layer, "changed source".to_owned())
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        let commit = project.move_page(first_page, 1).await.unwrap();
+        project.record_commit(&commit);
+        let first_summary = Project::pages(&project.snapshot())
+            .unwrap()
+            .into_iter()
+            .find(|page| page.id == first_page)
+            .unwrap();
+        assert_eq!(
+            (
+                first_summary.translated_texts,
+                first_summary.total_texts,
+                first_summary.inpainting_complete,
+                first_summary.detection_complete,
+            ),
+            (1, 2, false, true)
+        );
+
+        let commit = project.delete_layers(vec![second_layer]).await.unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::pages(&project.snapshot())
+                .unwrap()
+                .into_iter()
+                .find(|page| page.id == first_page)
+                .map(|page| {
+                    (
+                        page.translated_texts,
+                        page.total_texts,
+                        page.translation_complete,
+                    )
+                }),
+            Some((1, 1, true))
+        );
+        let (_, new_layer) = project
+            .add_point_text(first_page, Point { x: 30.0, y: 30.0 })
+            .await
+            .unwrap();
+        let page_summary = Project::pages(&project.snapshot())
+            .unwrap()
+            .into_iter()
+            .find(|page| page.id == first_page)
+            .unwrap();
+        assert_eq!(
+            (
+                page_summary.translated_texts,
+                page_summary.total_texts,
+                page_summary.translation_complete,
+            ),
+            (1, 2, false)
+        );
+        assert_ne!(first_layer, new_layer);
+    }
+
+    #[tokio::test]
+    async fn page_translation_markers_cover_text_layers_and_empty_pages() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("page-translation-markers.khrproj");
+        let (text_page, empty_page, first_layer) = {
+            let mut project = Project::create("page-translation-markers".to_owned(), path.clone())
+                .await
+                .unwrap();
+            let mut edit = project.snapshot().edit();
+            let text_page = edit
+                .add_page(PageDraft::new("text", 400.0, 300.0), At::End)
+                .unwrap();
+            let empty_page = edit
+                .add_page(PageDraft::new("empty", 400.0, 300.0), At::End)
+                .unwrap();
+            project
+                .session
+                .commit(edit.finish().unwrap())
+                .await
+                .unwrap();
+
+            let (_, first_layer) = project
+                .add_point_text(text_page, Point { x: 10.0, y: 10.0 })
+                .await
+                .unwrap();
+            let (_, second_layer) = project
+                .add_point_text(text_page, Point { x: 10.0, y: 50.0 })
+                .await
+                .unwrap();
+            let commit = project
+                .set_progress_markers(vec![text_page], None, ProgressKind::Translation, true)
+                .await
+                .unwrap();
+            project.record_commit(&commit);
+
+            let snapshot = project.snapshot();
+            for layer in [first_layer, second_layer] {
+                let content = snapshot.text_layer(layer).unwrap().content().unwrap().id();
+                assert_eq!(
+                    snapshot
+                        .component::<PipelineProgress>(content)
+                        .unwrap()
+                        .and_then(|progress| progress.status(ProgressKind::Translation)),
+                    Some(ProgressStatus::Complete(ProgressOrigin::Manual))
+                );
+            }
+            assert_eq!(
+                Project::pages(&snapshot)
+                    .unwrap()
+                    .iter()
+                    .find(|page| page.id == text_page)
+                    .map(|page| (
+                        page.translation_complete,
+                        page.translated_texts,
+                        page.total_texts
+                    )),
+                Some((true, 2, 2))
+            );
+            let commit = project
+                .set_progress_markers(vec![empty_page], None, ProgressKind::Translation, true)
+                .await
+                .unwrap();
+            project.record_commit(&commit);
+            assert_eq!(
+                project
+                    .snapshot()
+                    .component::<PipelineProgress>(empty_page)
+                    .unwrap()
+                    .and_then(|progress| progress.status(ProgressKind::Translation)),
+                Some(ProgressStatus::Complete(ProgressOrigin::Manual))
+            );
+            assert!(
+                Project::pages(&project.snapshot())
+                    .unwrap()
+                    .iter()
+                    .find(|page| page.id == empty_page)
+                    .unwrap()
+                    .translation_complete
+            );
+
+            let commit = project
+                .set_progress_markers(vec![text_page], None, ProgressKind::Translation, false)
+                .await
+                .unwrap();
+            project.record_commit(&commit);
+            assert_eq!(
+                Project::translation_progress(&project.snapshot(), text_page).unwrap(),
+                (0, 2)
+            );
+            let commit = project
+                .set_progress_markers(
+                    Vec::new(),
+                    Some(first_layer),
+                    ProgressKind::Translation,
+                    true,
+                )
+                .await
+                .unwrap();
+            project.record_commit(&commit);
+            assert_eq!(
+                Project::translation_progress(&project.snapshot(), text_page).unwrap(),
+                (1, 2)
+            );
+            (text_page, empty_page, first_layer)
+        };
+
+        let reopened = Project::open("page-translation-markers".to_owned(), path)
+            .await
+            .unwrap();
+        let snapshot = reopened.snapshot();
+        let content = snapshot
+            .text_layer(first_layer)
+            .unwrap()
+            .content()
+            .unwrap()
+            .id();
+        assert_eq!(
+            Project::translation_progress(&snapshot, text_page).unwrap(),
+            (1, 2)
+        );
+        assert_eq!(
+            snapshot
+                .component::<PipelineProgress>(content)
+                .unwrap()
+                .and_then(|progress| progress.status(ProgressKind::Translation)),
+            Some(ProgressStatus::Complete(ProgressOrigin::Manual))
+        );
+        assert_eq!(
+            snapshot
+                .component::<PipelineProgress>(empty_page)
+                .unwrap()
+                .and_then(|progress| progress.status(ProgressKind::Translation)),
+            Some(ProgressStatus::Complete(ProgressOrigin::Manual))
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_translation_counts_only_nonempty_text_and_ignores_visual_edits() {
+        let mut session = Session::memory().await.unwrap();
+        let mut edit = session.snapshot().edit();
+        let page = edit
+            .add_page(PageDraft::new("legacy translations", 400.0, 300.0), At::End)
+            .unwrap();
+        session.commit(edit.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "legacy-translation-progress".to_owned());
+
+        let mut layers = Vec::new();
+        for index in 0..4 {
+            let (_, layer) = project
+                .add_point_text(
+                    page,
+                    Point {
+                        x: 10.0,
+                        y: 20.0 + index as f64 * 40.0,
+                    },
+                )
+                .await
+                .unwrap();
+            project
+                .set_source_text(layer, format!("source {index}"))
+                .await
+                .unwrap();
+            layers.push(layer);
+        }
+
+        let snapshot = project.snapshot();
+        let contents = layers
+            .iter()
+            .map(|layer| snapshot.text_layer(*layer).unwrap().content().unwrap().id())
+            .collect::<Vec<_>>();
+        let patch = snapshot
+            .patch(|edit| {
+                edit.set(
+                    contents[0],
+                    &SceneTranslation {
+                        text: Authored::user("legacy translation".to_owned()),
+                        language: None,
+                    },
+                )?;
+                edit.set(
+                    contents[1],
+                    &SceneTranslation {
+                        text: Authored::user(String::new()),
+                        language: None,
+                    },
+                )?;
+                edit.set(
+                    contents[2],
+                    &SceneTranslation {
+                        text: Authored::user(" \t\n".to_owned()),
+                        language: None,
+                    },
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let commit = project.commit(patch).await.unwrap();
+        project.record_commit(&commit);
+
+        assert_eq!(
+            Project::translation_progress(&project.snapshot(), page).unwrap(),
+            (1, 4)
+        );
+
+        let parent = project.snapshot().parent(layers[0]).unwrap().unwrap();
+        let commit = project.move_layer(layers[0], parent, 3).await.unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::translation_progress(&project.snapshot(), page).unwrap(),
+            (1, 4)
+        );
+
+        let commit = project
+            .set_geometry(vec![GeometryUpdate {
+                layer: layers[0],
+                points: Some(vec![
+                    Point { x: 10.0, y: 10.0 },
+                    Point { x: 120.0, y: 10.0 },
+                    Point { x: 120.0, y: 40.0 },
+                    Point { x: 10.0, y: 40.0 },
+                ]),
+            }])
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::translation_progress(&project.snapshot(), page).unwrap(),
+            (1, 4)
+        );
+
+        let commit = project
+            .set_source_text(layers[0], "changed source".to_owned())
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::translation_progress(&project.snapshot(), page).unwrap(),
+            (0, 4)
+        );
+        assert_eq!(
+            project
+                .snapshot()
+                .component::<PipelineProgress>(contents[0])
+                .unwrap()
+                .and_then(|progress| progress.status(ProgressKind::Translation)),
+            Some(ProgressStatus::Pending(ProgressOrigin::Automatic))
+        );
+
+        let commit = project
+            .set_translation(layers[0], Some(" \t\n".to_owned()))
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::translation_progress(&project.snapshot(), page).unwrap(),
+            (0, 4)
+        );
+        assert_eq!(
+            project
+                .snapshot()
+                .component::<PipelineProgress>(contents[0])
+                .unwrap()
+                .and_then(|progress| progress.status(ProgressKind::Translation)),
+            Some(ProgressStatus::Pending(ProgressOrigin::Manual))
+        );
+
+        let commit = project
+            .set_text_content(vec![TextContentUpdate {
+                layer: layers[0],
+                value: TextFieldUpdate::Translation(Some(String::new())),
+            }])
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::translation_progress(&project.snapshot(), page).unwrap(),
+            (0, 4)
+        );
+
+        let commit = project
+            .set_text_content(vec![TextContentUpdate {
+                layer: layers[0],
+                value: TextFieldUpdate::Translation(Some("manual translation".to_owned())),
+            }])
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        assert_eq!(
+            Project::translation_progress(&project.snapshot(), page).unwrap(),
+            (1, 4)
+        );
+    }
+
     #[test]
     fn opening_a_legacy_project_copies_it_and_preserves_the_original() {
         let documents = tempfile::tempdir().unwrap();
@@ -1691,23 +2499,36 @@ mod tests {
     }
 
     #[test]
-    fn deleting_through_norrix_does_not_remove_a_legacy_project() {
+    fn deleting_removes_legacy_projects_and_all_duplicate_copies() {
         let documents = tempfile::tempdir().unwrap();
         let legacy_root = documents.path().join("Koharu");
         let legacy_project = legacy_root.join("Example.khrproj");
+        let norrix_root = documents.path().join("Norrix");
+        let norrix_project = norrix_root.join("Example.khrproj");
         std::fs::create_dir_all(&legacy_project).unwrap();
+        std::fs::create_dir_all(&norrix_project).unwrap();
         std::fs::write(legacy_project.join("state-a.khr"), b"legacy").unwrap();
         let library = ProjectLibrary {
-            root: documents.path().join("Norrix"),
+            root: norrix_root,
             legacy_root,
+        };
+
+        library.delete("Example").unwrap();
+        assert!(!legacy_project.exists());
+        assert!(!norrix_project.exists());
+        assert!(library.delete("Example").is_err());
+    }
+
+    #[test]
+    fn deleting_a_missing_project_returns_an_error() {
+        let documents = tempfile::tempdir().unwrap();
+        let library = ProjectLibrary {
+            root: documents.path().join("Norrix"),
+            legacy_root: documents.path().join("Koharu"),
         };
         std::fs::create_dir_all(&library.root).unwrap();
 
         assert!(library.delete("Example").is_err());
-        assert_eq!(
-            std::fs::read(legacy_project.join("state-a.khr")).unwrap(),
-            b"legacy"
-        );
     }
 
     #[test]
@@ -1721,6 +2542,7 @@ mod tests {
             font_style: None,
             size: None,
             auto_fit: true,
+            auto_fit_size: None,
             color: None,
             stroke_color: None,
             stroke_width: None,
@@ -1740,6 +2562,176 @@ mod tests {
             Project::typography_view(typography).writing_mode,
             Some(WritingMode::Vertical)
         );
+    }
+
+    #[tokio::test]
+    async fn axis_resizes_pin_rendered_auto_fit_size_and_diagonal_resizes_release_it() {
+        let mut session = Session::memory().await.unwrap();
+        let mut edit = session.snapshot().edit();
+        let page = edit
+            .add_page(PageDraft::new("resize", 400.0, 300.0), At::End)
+            .unwrap();
+        let content = edit.add_text_content(page, At::End).unwrap();
+        edit.set(
+            content,
+            &SceneSourceText {
+                text: Authored::user("Source sentence".to_owned()),
+                language: None,
+            },
+        )
+        .unwrap();
+        edit.set(
+            content,
+            &SceneTranslation {
+                text: Authored::user("A sentence that fits at a stable size".to_owned()),
+                language: None,
+            },
+        )
+        .unwrap();
+        let element = edit
+            .add_text_layer(
+                page,
+                At::End,
+                content,
+                &SceneTextLayout {
+                    origin: Origin::User,
+                    kind: TextLayoutKind::Paragraph,
+                    angle_degrees: Some(0.0),
+                },
+            )
+            .unwrap();
+        edit.set(element, &SceneGeometry::rectangle(20.0, 30.0, 160.0, 80.0))
+            .unwrap();
+        edit.set(
+            element,
+            &SceneTypography {
+                origin: Origin::User,
+                preferred_font: None,
+                font_weight: None,
+                font_style: None,
+                size: None,
+                auto_fit: true,
+                auto_fit_size: None,
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                alignment: None,
+                writing_mode: None,
+                line_height: None,
+                letter_spacing: None,
+                extensions: Default::default(),
+            },
+        )
+        .unwrap();
+        session.commit(edit.finish().unwrap()).await.unwrap();
+        let mut project = Project::new(session, "resize-test".to_owned());
+
+        for (frame, diagonal) in [
+            (
+                Frame {
+                    x: 20.0,
+                    y: 30.0,
+                    width: 240.0,
+                    height: 80.0,
+                    angle_degrees: 0.0,
+                },
+                false,
+            ),
+            (
+                Frame {
+                    x: 20.0,
+                    y: 30.0,
+                    width: 240.0,
+                    height: 120.0,
+                    angle_degrees: 0.0,
+                },
+                false,
+            ),
+        ] {
+            let commit = project
+                .set_geometries([(
+                    element,
+                    Project::geometry_from_frame(frame).unwrap(),
+                    frame.angle_degrees,
+                    diagonal,
+                    18.5,
+                )])
+                .await
+                .unwrap();
+            project.record_commit(&commit);
+            let typography = project
+                .snapshot()
+                .component::<SceneTypography>(element)
+                .unwrap()
+                .unwrap();
+            assert!(typography.auto_fit);
+            assert_eq!(typography.auto_fit_size, Some(18.5));
+        }
+
+        let diagonal_frame = Frame {
+            x: 20.0,
+            y: 30.0,
+            width: 300.0,
+            height: 150.0,
+            angle_degrees: 0.0,
+        };
+        let commit = project
+            .set_geometries([(
+                element,
+                Project::geometry_from_frame(diagonal_frame).unwrap(),
+                diagonal_frame.angle_degrees,
+                true,
+                18.5,
+            )])
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        let mut typography = project
+            .snapshot()
+            .component::<SceneTypography>(element)
+            .unwrap()
+            .unwrap();
+        assert!(typography.auto_fit);
+        assert_eq!(typography.auto_fit_size, None);
+
+        typography.auto_fit = false;
+        typography.size = Some(22.0);
+        let commit = project
+            .commit(
+                project
+                    .snapshot()
+                    .patch(|edit| edit.set(element, &typography))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        let commit = project
+            .set_geometries([(
+                element,
+                Project::geometry_from_frame(Frame {
+                    x: 20.0,
+                    y: 30.0,
+                    width: 360.0,
+                    height: 180.0,
+                    angle_degrees: 0.0,
+                })
+                .unwrap(),
+                0.0,
+                true,
+                18.5,
+            )])
+            .await
+            .unwrap();
+        project.record_commit(&commit);
+        let typography = project
+            .snapshot()
+            .component::<SceneTypography>(element)
+            .unwrap()
+            .unwrap();
+        assert!(!typography.auto_fit);
+        assert_eq!(typography.size, Some(22.0));
+        assert_eq!(typography.auto_fit_size, None);
     }
 
     #[tokio::test]
@@ -1852,6 +2844,31 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            assert_eq!(project.page_for_layer(layer).unwrap(), page);
+            let mut add_second_page = project.snapshot().edit();
+            let second_page = add_second_page
+                .add_page(PageDraft::new("second page", 1200.0, 2296.0), At::End)
+                .unwrap();
+            project
+                .session
+                .commit(add_second_page.finish().unwrap())
+                .await
+                .unwrap();
+            let (_, second_layer) = project
+                .add_text_box(
+                    second_page,
+                    Frame {
+                        x: 24.0,
+                        y: 32.0,
+                        width: 320.0,
+                        height: 120.0,
+                        angle_degrees: 0.0,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(project.active_page(), Some(page));
+            assert_eq!(project.page_for_layer(second_layer).unwrap(), second_page);
             project.record_commit(&created);
             let created_snapshot = project.snapshot();
             let content = created_snapshot
@@ -1899,6 +2916,7 @@ mod tests {
                     .unwrap(),
                     0.0,
                     true,
+                    36.0,
                 )])
                 .await
                 .unwrap();
@@ -1931,7 +2949,15 @@ mod tests {
         assert_eq!(typography.as_ref().unwrap().line_height, Some(1.75));
         assert_eq!(typography.as_ref().unwrap().letter_spacing, Some(60.0));
         assert!(typography.as_ref().unwrap().auto_fit);
-        assert_eq!(typography.as_ref().unwrap().size, Some(512.0));
+        assert_eq!(typography.as_ref().unwrap().size, None);
+        assert_eq!(
+            snapshot
+                .component::<SceneTypography>(layer)
+                .unwrap()
+                .unwrap()
+                .auto_fit_size,
+            None
+        );
         assert_eq!(typography.as_ref().unwrap().line_height, Some(1.75));
         assert_eq!(snapshot.parent(content.id).unwrap(), Some(page));
     }

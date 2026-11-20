@@ -1,4 +1,7 @@
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    time::Instant,
+};
 
 use anyhow::{Context, Result, anyhow};
 use petgraph::{
@@ -144,10 +147,35 @@ impl Plan {
         })?;
         for node in order {
             let component = self.graph[node];
-            component.activate().await?;
+            let component_name = component.label();
+            let activation_started = Instant::now();
+            match component.activate().await {
+                Ok(()) => tracing::info!(
+                    event = "runtime_component_activation_finished",
+                    component = %component_name,
+                    duration_ms = activation_started.elapsed().as_secs_f64() * 1000.0,
+                    result = "activated",
+                ),
+                Err(error) => {
+                    tracing::error!(
+                        event = "runtime_component_activation_finished",
+                        component = %component_name,
+                        duration_ms = activation_started.elapsed().as_secs_f64() * 1000.0,
+                        result = "failed",
+                    );
+                    return Err(error);
+                }
+            }
             if let Component::Rocm(rocm) = component {
+                let probe_started = Instant::now();
                 device.index = rocm.probe().await?;
                 device.name = format!("ROCm{}", device.index);
+                tracing::info!(
+                    event = "runtime_component_probe_finished",
+                    component = "ROCm",
+                    duration_ms = probe_started.elapsed().as_secs_f64() * 1000.0,
+                    result = "probed",
+                );
             }
         }
         Ok(device)

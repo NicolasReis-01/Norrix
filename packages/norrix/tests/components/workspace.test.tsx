@@ -18,6 +18,9 @@ const canvas = vi.hoisted(() => ({
   activateFrame: vi.fn(),
   activatePage: vi.fn(),
   setPageLayout: vi.fn(),
+  pinPageManifests: vi.fn(),
+  unpinPageManifests: vi.fn(),
+  getLastLayoutRejection: vi.fn<() => string | null>(() => null),
   clear: vi.fn(),
   previewOpacity: vi.fn(),
   beginTransform: vi.fn(),
@@ -41,14 +44,16 @@ const canvasState = vi.hoisted(() => ({
   status: 'ready' as 'loading' | 'switching' | 'ready' | 'recovering' | 'error',
 }))
 const prefetchCanvasPages = vi.hoisted(() => vi.fn(async () => []))
+const useCanvasMock = vi.hoisted(() => vi.fn())
 
 vi.mock('@/components/editor/useCanvas', () => ({
-  useCanvas: () => canvasState,
+  useCanvas: (...args: unknown[]) => useCanvasMock(...args),
 }))
 vi.mock('@norrix/bridge/canvas', () => ({
   prefetchCanvasPages,
   previewCanvasOpacity: (element: string, opacity: number | null) =>
     canvas.previewOpacity(element, opacity),
+  traceCanvas: vi.fn(),
   workspaceColor: () => [245, 245, 245],
 }))
 
@@ -131,6 +136,7 @@ function textLayer(id: string): Layer {
       id,
       source: { text: 'Matching line', language: 'en' },
       translation: null,
+      translation_complete: false,
       role: null,
       source_region: null,
     },
@@ -171,8 +177,11 @@ beforeEach(() => {
   canvasState.generation = 1
   canvasState.hasFrame = true
   canvasState.status = 'ready'
+  useCanvasMock.mockReturnValue(canvasState)
   canvas.setPageLayout.mockReturnValue(true)
-  prefetchCanvasPages.mockClear()
+  canvas.getLastLayoutRejection.mockReturnValue(null)
+  prefetchCanvasPages.mockReset()
+  prefetchCanvasPages.mockImplementation(async () => [])
 })
 
 afterEach(() => vi.unstubAllGlobals())
@@ -334,15 +343,15 @@ function renderWorkspace() {
   return surface
 }
 
-function transitionCanvasGeneration(generation: number) {
+function transitionCanvasGeneration(generation: number, revision = generation) {
   act(() => {
     canvasState.status = 'switching'
-    useNorrixStore.setState({ canvasGeneration: generation })
+    useNorrixStore.setState({ canvasGeneration: generation, canvasRevision: revision - 1 })
   })
   act(() => {
     canvasState.status = 'ready'
     canvasState.generation = generation
-    useNorrixStore.setState({ canvasRevision: generation })
+    useNorrixStore.setState({ canvasGeneration: generation, canvasRevision: revision })
   })
 }
 
@@ -393,7 +402,12 @@ describe('canvas interaction adapter', () => {
     expect(prefetchCanvasPages).not.toHaveBeenCalled()
 
     act(() => useNorrixStore.setState({ canvasPage: 'page' }))
-    await waitFor(() => expect(prefetchCanvasPages).toHaveBeenCalledWith(['next']))
+    await waitFor(() =>
+      expect(prefetchCanvasPages).toHaveBeenCalledWith(
+        ['next'],
+        expect.objectContaining({ operation: 'single-page-adjacent-prefetch' }),
+      ),
+    )
   })
 
   it('renders an accessible browser canvas and keeps camera updates local', async () => {
@@ -405,6 +419,210 @@ describe('canvas interaction adapter', () => {
     fireEvent.wheel(surface, { clientX: 100, clientY: 100, deltaY: 6 })
 
     await waitFor(() => expect(canvas.setView).toHaveBeenLastCalledWith(1, [0, -10]))
+  })
+
+  it('shows a loading diagnostic only while no valid canvas frame is available', () => {
+    installProject()
+    canvasState.hasFrame = false
+    canvasState.status = 'loading'
+    renderWorkspace()
+
+    expect(screen.getByTestId('canvas-frame-loading')).toHaveAttribute('data-page', 'page')
+    expect(screen.getByTestId('canvas-frame-loading')).toHaveAttribute('data-generation', '1')
+
+    act(() => {
+      canvasState.hasFrame = true
+      canvasState.status = 'switching'
+      useNorrixStore.setState({ canvasGeneration: 2 })
+    })
+
+    expect(screen.queryByTestId('canvas-frame-loading')).not.toBeInTheDocument()
+  })
+
+  it('does not replace the current composition with an empty layout while a revision is unavailable', () => {
+    installProject()
+    useNorrixStore.setState({ canvasRevision: null })
+    renderWorkspace()
+
+    expect(canvas.setPageLayout).not.toHaveBeenCalledWith([])
+  })
+
+  it('retains the last accepted layout until the newly visible Infinite Scroll page is prepared', async () => {
+    installProject()
+    const first = {
+      id: 'page',
+      label: 'Page',
+      size: { width: 1000, height: 1000 },
+      source_asset: null,
+      layer_count: 1,
+    }
+    const second = { ...first, id: 'page-2', label: 'Page 2' }
+    queryClient.setQueryData(pagesKey, [first, second])
+    queryClient.setQueryData(preparedPageKey(first.id), {
+      page: { ...queryClient.getQueryData(pageKey)!, id: first.id, label: first.label },
+      revision: 1,
+      element_frames: [],
+      text_font_sizes: [],
+    })
+    vi.spyOn(commands, 'prepareCanvasPage').mockResolvedValue(null)
+    useNorrixStore.setState({
+      workspaceMode: 'infinite',
+      selectedPage: first.id,
+      camera: { zoom: 1, translation: [0, 0], fitted: false },
+    })
+
+    const surface = renderWorkspace()
+    window.dispatchEvent(new Event('resize'))
+    await waitFor(() =>
+      expect(canvas.setPageLayout).toHaveBeenLastCalledWith([
+        expect.objectContaining({ page: first.id, revision: 1 }),
+      ]),
+    )
+    const layoutCallCount = canvas.setPageLayout.mock.calls.length
+
+    Object.defineProperty(surface, 'scrollTop', {
+      configurable: true,
+      writable: true,
+      value: 900,
+    })
+    fireEvent.scroll(surface)
+
+    await waitFor(() => expect(useNorrixStore.getState().selectedPage).toBe(second.id))
+    expect(canvas.setPageLayout).toHaveBeenCalledTimes(layoutCallCount)
+    expect(canvas.setPageLayout).not.toHaveBeenCalledWith([])
+  })
+
+  it('reapplies the layout using the revision returned by frame recovery', async () => {
+    installProject()
+    canvas.setPageLayout.mockReturnValueOnce(false).mockReturnValue(true)
+    prefetchCanvasPages.mockImplementation(async () => [
+      { revision: 2, page: { id: 'page' } } as never,
+    ])
+    renderWorkspace()
+
+    await waitFor(() =>
+      expect(prefetchCanvasPages).toHaveBeenCalledWith(
+        ['page'],
+        expect.objectContaining({ operation: 'layout-recovery' }),
+      ),
+    )
+    await waitFor(() => expect(canvas.setPageLayout).toHaveBeenCalledTimes(2))
+    expect(canvas.setPageLayout).toHaveBeenLastCalledWith([
+      expect.objectContaining({ page: 'page', revision: 2 }),
+    ])
+    expect(canvas.pinPageManifests).toHaveBeenCalledWith(['page'])
+    await waitFor(() => expect(canvas.unpinPageManifests).toHaveBeenCalledWith(['page']))
+    expect(canvas.pinPageManifests.mock.invocationCallOrder[0]).toBeLessThan(
+      prefetchCanvasPages.mock.invocationCallOrder[0]!,
+    )
+    expect(canvas.unpinPageManifests.mock.invocationCallOrder[0]).toBeGreaterThan(
+      canvas.setPageLayout.mock.invocationCallOrder[1]!,
+    )
+    expect(screen.queryByTestId('canvas-layout-error')).not.toBeInTheDocument()
+  })
+
+  it('uses the renderer validation reason when a complete recovered layout is rejected', async () => {
+    installProject()
+    canvas.setPageLayout.mockReturnValue(false)
+    canvas.getLastLayoutRejection.mockReturnValue('page=page result=missing_manifest')
+    prefetchCanvasPages.mockResolvedValue([{ revision: 2, page: { id: 'page' } } as never])
+    vi.stubEnv('NODE_ENV', 'development')
+    const report = vi.spyOn(console, 'error').mockImplementation(() => {})
+    renderWorkspace()
+
+    await waitFor(() =>
+      expect(report).toHaveBeenCalledWith(
+        '[Norrix canvas]',
+        'layout-restore-failed',
+        expect.objectContaining({
+          reason: 'page=page result=missing_manifest',
+          result: 'setPageLayout-returned-false',
+        }),
+      ),
+    )
+  })
+
+  it('keeps the previous composition visible when frame recovery cannot complete', async () => {
+    installProject()
+    canvas.setPageLayout.mockReturnValue(false)
+    prefetchCanvasPages.mockResolvedValue([])
+    renderWorkspace()
+
+    const alert = await screen.findByTestId('canvas-layout-error')
+    expect(alert).not.toHaveClass('inset-0')
+    expect(canvas.setPageLayout).toHaveBeenCalledWith([
+      expect.objectContaining({ page: 'page', revision: 1 }),
+    ])
+    expect(canvas.setPageLayout).toHaveBeenCalledTimes(1)
+    expect(canvas.setPageLayout).not.toHaveBeenCalledWith([])
+  })
+
+  it('keeps the renderer target on the presented page while Infinite Scroll selection data is missing', async () => {
+    installProject()
+    queryClient.setQueryData(pagesKey, [
+      {
+        id: 'page',
+        label: 'Page',
+        size: { width: 1000, height: 1000 },
+        source_asset: null,
+        layer_count: 1,
+      },
+      {
+        id: 'page-2',
+        label: 'Page 2',
+        size: { width: 1000, height: 1000 },
+        source_asset: null,
+        layer_count: 1,
+      },
+    ])
+    useNorrixStore.setState({
+      workspaceMode: 'infinite',
+      selectedPage: 'page-2',
+      canvasPage: 'page',
+      canvasRevision: 1,
+      canvasGeneration: 1,
+    })
+
+    renderWorkspace()
+
+    await waitFor(() => expect(useCanvasMock.mock.calls.at(-1)?.[3]).toBe('page'))
+    expect(canvas.clear).not.toHaveBeenCalled()
+  })
+
+  it('logs serializable error details when frame recovery rejects a non-Error value', async () => {
+    installProject()
+    vi.stubEnv('NODE_ENV', 'development')
+    canvas.setPageLayout.mockReturnValue(false)
+    prefetchCanvasPages.mockRejectedValue({
+      name: 'FrameFetchError',
+      message: 'page manifest fetch failed',
+      cause: { code: 'FRAME_NOT_PREPARED', message: 'revision was evicted' },
+    })
+    const report = vi.spyOn(console, 'error').mockImplementation(() => {})
+    renderWorkspace()
+
+    await waitFor(() => expect(screen.getByTestId('canvas-layout-error')).toBeInTheDocument())
+    const details = report.mock.calls.find(([, event]) => event === 'layout-prefetch-failed')?.[2]
+    expect(details).toEqual(
+      expect.objectContaining({
+        name: 'FrameFetchError',
+        message: 'page manifest fetch failed',
+        cause: expect.objectContaining({
+          name: 'Object',
+          message: 'revision was evicted',
+        }),
+        operation: 'prefetchCanvasPages',
+        requestedPages: [expect.objectContaining({ page: 'page' })],
+        generation: 1,
+        requestedLayouts: [expect.objectContaining({ page: 'page', revision: 1 })],
+        canvasScrollTopBefore: 0,
+        canvasScrollTopAfter: 0,
+        pageRailScrollTopBefore: null,
+        pageRailScrollTopAfter: null,
+      }),
+    )
+    report.mockRestore()
+    vi.unstubAllEnvs()
   })
 
   it('preserves a manual camera when a newer canvas generation becomes ready', () => {
@@ -521,6 +739,118 @@ describe('canvas interaction adapter', () => {
       useNorrixStore.getState().camera.translation,
     )
     expect(canvas.setPageLayout).toHaveBeenCalledTimes(layoutCallCount)
+  })
+
+  it('keeps the active page and viewport anchor stable while zooming in infinite mode', async () => {
+    installProject()
+    const summaries = [1, 2, 3].map((number) => ({
+      id: `page-${number}`,
+      label: `Page ${number}`,
+      size: { width: 1000, height: 1000 },
+      source_asset: null,
+      layer_count: 1,
+    }))
+    queryClient.setQueryData(pagesKey, summaries)
+    for (const summary of summaries) {
+      const page = {
+        ...queryClient.getQueryData(pageKey)!,
+        id: summary.id,
+        label: summary.label,
+      }
+      queryClient.setQueryData(preparedPageKey(summary.id), {
+        page,
+        revision: 1,
+        element_frames: [],
+        text_font_sizes: [],
+      })
+    }
+    useNorrixStore.setState({
+      workspaceMode: 'infinite',
+      selectedPage: 'page-2',
+      pageNavigation: null,
+      camera: { zoom: 1, translation: [0, 0], fitted: false },
+    })
+
+    const surface = renderWorkspace()
+    Object.defineProperty(surface, 'scrollTop', {
+      configurable: true,
+      writable: true,
+      value: 800,
+    })
+    fireEvent.scroll(surface)
+    expect(useNorrixStore.getState().selectedPage).toBe('page-2')
+
+    const previousDocumentY =
+      (surface.scrollTop + surface.clientHeight * 0.5) *
+      (window.devicePixelRatio / useNorrixStore.getState().camera.zoom)
+    fireEvent.wheel(surface, { ctrlKey: true, deltaY: -100 })
+    await waitFor(() => expect(useNorrixStore.getState().camera.zoom).toBeGreaterThan(1))
+
+    const nextDocumentY =
+      (surface.scrollTop + surface.clientHeight * 0.5) *
+      (window.devicePixelRatio / useNorrixStore.getState().camera.zoom)
+    expect(nextDocumentY).toBeCloseTo(previousDocumentY)
+    expect(useNorrixStore.getState().selectedPage).toBe('page-2')
+
+    fireEvent.wheel(surface, { ctrlKey: true, deltaY: 100 })
+    await waitFor(() => expect(useNorrixStore.getState().camera.zoom).toBeCloseTo(1))
+    expect(useNorrixStore.getState().selectedPage).toBe('page-2')
+  })
+
+  it('preserves the active page and viewport anchor when zoom changes from the status slider', async () => {
+    installProject()
+    const summaries = [1, 2, 3].map((number) => ({
+      id: `page-${number}`,
+      label: `Page ${number}`,
+      size: { width: 1000, height: 1000 },
+      source_asset: null,
+      layer_count: 1,
+    }))
+    queryClient.setQueryData(pagesKey, summaries)
+    for (const summary of summaries) {
+      queryClient.setQueryData(preparedPageKey(summary.id), {
+        page: {
+          ...queryClient.getQueryData(pageKey)!,
+          id: summary.id,
+          label: summary.label,
+        },
+        revision: 1,
+        element_frames: [],
+        text_font_sizes: [],
+      })
+    }
+    useNorrixStore.setState({
+      workspaceMode: 'infinite',
+      selectedPage: 'page-2',
+      pageNavigation: null,
+      camera: { zoom: 1, translation: [0, 0], fitted: false },
+    })
+
+    const surface = renderWorkspace()
+    Object.defineProperty(surface, 'scrollTop', {
+      configurable: true,
+      writable: true,
+      value: 800,
+    })
+    fireEvent.scroll(surface)
+    const getDocumentY = () =>
+      (surface.scrollTop + surface.clientHeight * 0.5) *
+      (window.devicePixelRatio / useNorrixStore.getState().camera.zoom)
+    const initialDocumentY = getDocumentY()
+    const slider = document.querySelector<HTMLInputElement>(
+      '[data-slot="slider"] input[type="range"]',
+    )
+    if (!slider) throw new Error('zoom range input is missing')
+
+    fireEvent.change(slider, { target: { value: '105' } })
+    await waitFor(() => expect(useNorrixStore.getState().camera.zoom).toBeGreaterThan(1))
+    expect(getDocumentY()).toBeCloseTo(initialDocumentY)
+    expect(useNorrixStore.getState().selectedPage).toBe('page-2')
+
+    fireEvent.change(slider, { target: { value: '100' } })
+    await waitFor(() => expect(useNorrixStore.getState().camera.zoom).toBeCloseTo(1))
+    expect(getDocumentY()).toBeCloseTo(initialDocumentY)
+    expect(useNorrixStore.getState().selectedPage).toBe('page-2')
   })
 
   it('composes adjacent-page ghost text automatically in both workspace modes', async () => {
@@ -696,6 +1026,7 @@ describe('canvas interaction adapter', () => {
     fireEvent.pointerMove(surface, { pointerId: 32, clientX: 60, clientY: 70 })
     fireEvent.pointerUp(surface, { pointerId: 32, clientX: 60, clientY: 70 })
     await waitFor(() => expect(transform).toHaveBeenCalledOnce())
+    transitionCanvasGeneration(2, 3)
 
     Object.defineProperty(screen.getByTestId('canvas-overlay'), 'getBoundingClientRect', {
       value: () => ({ x: 10, y: 20, width: 800, height: 600 }),
@@ -705,6 +1036,7 @@ describe('canvas interaction adapter', () => {
     fireEvent.pointerMove(rotate, { pointerId: 33, clientX: 80, clientY: 45 })
     fireEvent.pointerUp(rotate, { pointerId: 33, clientX: 80, clientY: 45 })
     await waitFor(() => expect(transform).toHaveBeenCalledTimes(2))
+    transitionCanvasGeneration(3, 3)
 
     act(() => useNorrixStore.setState({ tool: 'text' }))
     fireEvent.pointerDown(surface, { button: 0, pointerId: 34, clientX: 40, clientY: 50 })
@@ -788,6 +1120,7 @@ describe('canvas interaction adapter', () => {
             id: 'content',
             source: { text: 'Source', language: 'en' },
             translation: { text: 'Rendered', language: null },
+            translation_complete: true,
             role: null,
             source_region: null,
           },
@@ -900,7 +1233,7 @@ describe('canvas interaction adapter', () => {
         expect(setTranslation).toHaveBeenCalledWith(
           'editable',
           'Edited line one\nEdited line two',
-          null,
+          expect.any(String),
         ),
       )
 
@@ -911,6 +1244,19 @@ describe('canvas interaction adapter', () => {
       await waitFor(() =>
         expect(screen.queryByTestId('inline-text-editor')).not.toBeInTheDocument(),
       )
+      if (mode === 'single') {
+        expect(setTranslation).toHaveBeenLastCalledWith(
+          'editable',
+          'Edited line one\nEdited line two',
+          null,
+        )
+      } else {
+        expect(setTranslation).toHaveBeenLastCalledWith(
+          'editable',
+          'Edited line one\nEdited line two',
+          expect.any(String),
+        )
+      }
       expect(canvas.previewOpacity).toHaveBeenLastCalledWith('editable', null)
       fireEvent.keyDown(surface, { key: 'z', ctrlKey: true })
       fireEvent.keyDown(surface, { key: 'z', ctrlKey: true, shiftKey: true })
@@ -943,7 +1289,11 @@ describe('canvas interaction adapter', () => {
 
     await waitFor(() => expect(editor).toHaveValue('Onewinal translation'))
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenLastCalledWith('editable', 'Onewinal translation', null),
+      expect(setTranslation).toHaveBeenLastCalledWith(
+        'editable',
+        'Onewinal translation',
+        expect.any(String),
+      ),
     )
   })
 
@@ -961,14 +1311,22 @@ describe('canvas interaction adapter', () => {
 
     await waitFor(() => expect(editor).toHaveValue('Onewinal translation'))
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenCalledWith('editable', 'Onewinal translation', null),
+      expect(setTranslation).toHaveBeenCalledWith(
+        'editable',
+        'Onewinal translation',
+        expect.any(String),
+      ),
     )
 
     editor.setSelectionRange(1, 4)
     await user.paste('paste')
     await waitFor(() => expect(editor).toHaveValue('Opasteinal translation'))
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenLastCalledWith('editable', 'Opasteinal translation', null),
+      expect(setTranslation).toHaveBeenLastCalledWith(
+        'editable',
+        'Opasteinal translation',
+        expect.any(String),
+      ),
     )
   })
 
@@ -988,7 +1346,9 @@ describe('canvas interaction adapter', () => {
 
     fireEvent.change(editor, { target: { value: 'abXe' } })
     await waitFor(() => expect(editor).toHaveValue('abXe'))
-    await waitFor(() => expect(setTranslation).toHaveBeenLastCalledWith('editable', 'abXe', null))
+    await waitFor(() =>
+      expect(setTranslation).toHaveBeenLastCalledWith('editable', 'abXe', expect.any(String)),
+    )
   })
 
   it('keeps the active editor, focus, and caret through canvas generation transitions', async () => {
@@ -1063,7 +1423,7 @@ describe('canvas interaction adapter', () => {
     transitionCanvasGeneration(4)
 
     expect(editor).toHaveValue('nPw')
-    expect(setTranslation).toHaveBeenLastCalledWith('editable', 'nPw', null)
+    expect(setTranslation).toHaveBeenLastCalledWith('editable', 'nPw', expect.any(String))
   })
 
   it('preserves insertion and deletion caret positions during canvas updates', async () => {
@@ -1104,7 +1464,11 @@ describe('canvas interaction adapter', () => {
 
     expect(editor).toHaveFocus()
     expect(editor.selectionStart).toBe(3)
-    expect(setTranslation).toHaveBeenLastCalledWith('editable', 'abcrXYZiginal translation', null)
+    expect(setTranslation).toHaveBeenLastCalledWith(
+      'editable',
+      'abcrXYZiginal translation',
+      expect.any(String),
+    )
   })
 
   it('ends inline editing when the selected page or project changes', async () => {
@@ -1168,7 +1532,7 @@ describe('canvas interaction adapter', () => {
     fireEvent.keyDown(editor, { key: 'Enter', ctrlKey: true, isComposing: true })
     fireEvent.change(editor, { target: { value: 'composed draft' } })
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenCalledWith('editable', 'composed draft', null),
+      expect(setTranslation).toHaveBeenCalledWith('editable', 'composed draft', expect.any(String)),
     )
     fireEvent.compositionEnd(editor, { data: ' composed' })
     fireEvent.keyDown(editor, { key: 'Enter', ctrlKey: true })
@@ -1195,6 +1559,9 @@ describe('canvas interaction adapter', () => {
 
     await waitFor(() => expect(writes).toEqual(['A', 'Ab', 'Abc']))
     expect(setTranslation).toHaveBeenCalledTimes(3)
+    const editSessions = setTranslation.mock.calls.map(([, , editSession]) => editSession)
+    expect(editSessions[0]).toEqual(expect.any(String))
+    expect(new Set(editSessions).size).toBe(1)
     expect(editor).toHaveValue('Abc')
   })
 
@@ -1208,7 +1575,11 @@ describe('canvas interaction adapter', () => {
     fireEvent.keyDown(editor, { key: 'Enter', metaKey: true })
 
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenCalledWith('editable', 'Confirmed with Command', null),
+      expect(setTranslation).toHaveBeenCalledWith(
+        'editable',
+        'Confirmed with Command',
+        expect.any(String),
+      ),
     )
     expect(screen.getByTestId('inline-text-editor')).toBeInTheDocument()
     fireEvent.blur(editor)
@@ -1232,9 +1603,42 @@ describe('canvas interaction adapter', () => {
 
     expect(screen.getByTestId('inline-text-editor')).toHaveValue('Keep this draft')
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenCalledWith('editable', 'Keep this draft', null),
+      expect(setTranslation).toHaveBeenCalledWith(
+        'editable',
+        'Keep this draft',
+        expect.any(String),
+      ),
     )
     expect(canvas.previewOpacity).toHaveBeenLastCalledWith('editable', 0)
+  })
+
+  it('keeps the edit session active across a pause between typing', async () => {
+    installEditableText()
+    const setTranslation = vi.spyOn(commands, 'setTranslation').mockResolvedValue(null)
+    vi.spyOn(commands, 'previewTextLayout').mockImplementation(
+      async (_page, _element, text, revision) => textPreview(text, revision),
+    )
+    const surface = renderWorkspace()
+    fireEvent.keyDown(surface, { key: 'Enter' })
+    const editor = await screen.findByTestId('inline-text-editor')
+    fireEvent.change(editor, { target: { value: 'First words' } })
+    await waitFor(() => expect(setTranslation).toHaveBeenCalledOnce())
+    const editSession = setTranslation.mock.calls[0]?.[2]
+    expect(editSession).toEqual(expect.any(String))
+
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 600)))
+
+    expect(screen.getByTestId('inline-text-editor')).toBeInTheDocument()
+    expect(editor).toHaveValue('First words')
+    fireEvent.change(editor, { target: { value: 'First words, continued' } })
+    await waitFor(() =>
+      expect(setTranslation).toHaveBeenLastCalledWith(
+        'editable',
+        'First words, continued',
+        editSession,
+      ),
+    )
+    expect(screen.getByTestId('inline-text-editor')).toHaveValue('First words, continued')
   })
 
   it('restores editor focus after the window regains focus when the editor owned focus', async () => {
@@ -1252,7 +1656,11 @@ describe('canvas interaction adapter', () => {
     await waitFor(() => expect(editor).toHaveFocus())
     expect(editor).toHaveValue('Keep this draft')
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenCalledWith('editable', 'Keep this draft', null),
+      expect(setTranslation).toHaveBeenCalledWith(
+        'editable',
+        'Keep this draft',
+        expect.any(String),
+      ),
     )
 
     fireEvent.keyDown(editor, { key: 'Escape' })
@@ -1329,7 +1737,7 @@ describe('canvas interaction adapter', () => {
 
     expect(screen.getByTestId('inline-text-editor')).toHaveValue('Composed draft')
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenCalledWith('editable', 'Composed draft', null),
+      expect(setTranslation).toHaveBeenCalledWith('editable', 'Composed draft', expect.any(String)),
     )
 
     fireEvent.compositionEnd(editor, { data: 'Composed draft' })
@@ -1373,9 +1781,12 @@ describe('canvas interaction adapter', () => {
     await waitFor(() => expect(useNorrixStore.getState().selectedLayers).toEqual(['editable']))
     expect(screen.queryByTestId('inline-text-editor')).not.toBeInTheDocument()
     expect(commitTransform).toHaveBeenCalledOnce()
+    transitionCanvasGeneration(2, 2)
 
     fireEvent.pointerDown(surface, { ...pointer, pointerId: 84, detail: 1 })
     fireEvent.pointerUp(surface, { ...pointer, pointerId: 84, detail: 1 })
+    await waitFor(() => expect(commitTransform).toHaveBeenCalledTimes(2))
+    transitionCanvasGeneration(3, 2)
     expect(await screen.findByTestId('inline-text-editor')).toBeInTheDocument()
   })
 
@@ -1420,13 +1831,18 @@ describe('canvas interaction adapter', () => {
     fireEvent.pointerDown(surface, { ...pointer, pointerId: 100, detail: 1 })
     fireEvent.pointerUp(surface, { ...pointer, pointerId: 100, detail: 1 })
     await waitFor(() => expect(commitTransform).toHaveBeenCalledOnce())
+    transitionCanvasGeneration(2, 2)
     fireEvent.pointerDown(surface, { ...pointer, pointerId: 101, detail: 1 })
     fireEvent.pointerUp(surface, { ...pointer, pointerId: 101, detail: 1 })
+    await waitFor(() => expect(commitTransform).toHaveBeenCalledTimes(2))
+    transitionCanvasGeneration(3, 2)
 
     const editor = await screen.findByTestId('inline-text-editor')
     expect(editor).toHaveValue('')
     fireEvent.change(editor, { target: { value: 'New text' } })
-    await waitFor(() => expect(setTranslation).toHaveBeenCalledWith('editable', 'New text', null))
+    await waitFor(() =>
+      expect(setTranslation).toHaveBeenCalledWith('editable', 'New text', expect.any(String)),
+    )
     expect(editor).toHaveValue('New text')
     expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
@@ -1470,12 +1886,19 @@ describe('canvas interaction adapter', () => {
     fireEvent.pointerUp(surface, { ...pointer, pointerId: 89, detail: 1 })
     await waitFor(() => expect(commitTransform).toHaveBeenCalledOnce())
     await waitFor(() => expect(useNorrixStore.getState().selectedLayers).toEqual(['editable']))
+    transitionCanvasGeneration(2, 2)
 
     fireEvent.pointerDown(surface, { ...pointer, pointerId: 90, detail: 1 })
     act(() => {
-      useNorrixStore.setState({ canvasRevision: 2, canvasGeneration: 2 })
+      canvasState.status = 'switching'
+      useNorrixStore.setState({ canvasGeneration: 3 })
     })
     fireEvent.pointerUp(surface, { ...pointer, pointerId: 90, detail: 1 })
+    act(() => {
+      canvasState.status = 'ready'
+      canvasState.generation = 3
+      useNorrixStore.setState({ canvasRevision: 3 })
+    })
 
     expect(await screen.findByTestId('inline-text-editor')).toBeInTheDocument()
     expect(canvas.previewOpacity).toHaveBeenCalledWith('editable', 0)
@@ -1662,6 +2085,7 @@ describe('canvas interaction adapter', () => {
     fireEvent.pointerDown(surface, { ...pointer, pointerId: 93, detail: 1 })
     fireEvent.pointerUp(surface, { ...pointer, pointerId: 93, detail: 1 })
     await waitFor(() => expect(commitTransform).toHaveBeenCalledOnce())
+    transitionCanvasGeneration(2, 2)
 
     fireEvent.pointerDown(surface, { ...pointer, pointerId: 94, detail: 1 })
     fireEvent.pointerCancel(surface, { pointerId: 94 })
@@ -1736,12 +2160,12 @@ describe('canvas interaction adapter', () => {
     fireEvent.pointerUp(surface, { ...pointer, pointerId: 87 })
     await waitFor(() => expect(commitTransform).toHaveBeenCalledOnce())
 
-    act(() => {
-      useNorrixStore.setState({ canvasRevision: 2, canvasGeneration: 2 })
-    })
+    transitionCanvasGeneration(2, 2)
 
     fireEvent.pointerDown(surface, { ...pointer, pointerId: 88, detail: 1 })
     fireEvent.pointerUp(surface, { ...pointer, pointerId: 88 })
+    await waitFor(() => expect(commitTransform).toHaveBeenCalledTimes(2))
+    transitionCanvasGeneration(3, 2)
     expect(await screen.findByTestId('inline-text-editor')).toBeInTheDocument()
   })
 
@@ -1754,6 +2178,7 @@ describe('canvas interaction adapter', () => {
     fireEvent.pointerDown(surface, { ...pointer, detail: 1 })
     fireEvent.pointerUp(surface, pointer)
     await waitFor(() => expect(commitTransform).toHaveBeenCalledOnce())
+    transitionCanvasGeneration(2, 2)
 
     fireEvent.pointerDown(surface, { ...pointer, pointerId: 86, detail: 2 })
     fireEvent.pointerMove(surface, { pointerId: 86, clientX: 40, clientY: 60 })
@@ -1790,6 +2215,7 @@ describe('canvas interaction adapter', () => {
     expect(screen.queryByTestId('inline-text-editor')).not.toBeInTheDocument()
 
     await act(async () => finishTransform(2))
+    transitionCanvasGeneration(2, 2)
     expect(await screen.findByTestId('inline-text-editor')).toBeInTheDocument()
   })
 
@@ -1834,7 +2260,7 @@ describe('canvas interaction adapter', () => {
         expect(setTranslation).toHaveBeenCalledWith(
           'editable',
           'A much longer\npreview line',
-          null,
+          expect.any(String),
         ),
       )
       await waitFor(() => {
@@ -1915,7 +2341,11 @@ describe('canvas interaction adapter', () => {
     fireEvent.keyDown(editor, { key: 'Escape' })
     await new Promise((resolve) => window.setTimeout(resolve, 150))
     expect(preview).toHaveBeenCalledTimes(4)
-    expect(setTranslation).toHaveBeenLastCalledWith('editable', 'cancel this preview', null)
+    expect(setTranslation).toHaveBeenLastCalledWith(
+      'editable',
+      'cancel this preview',
+      expect.any(String),
+    )
     expect(screen.getByTestId('inline-text-editor')).toHaveValue('cancel this preview')
   })
 
@@ -1934,7 +2364,11 @@ describe('canvas interaction adapter', () => {
     expect(editor).toHaveStyle({ opacity: '1' })
     expect(screen.queryByTestId('inline-text-glyphs')).not.toBeInTheDocument()
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenCalledWith('editable', 'Can still save this', null),
+      expect(setTranslation).toHaveBeenCalledWith(
+        'editable',
+        'Can still save this',
+        expect.any(String),
+      ),
     )
   })
 
@@ -1959,7 +2393,7 @@ describe('canvas interaction adapter', () => {
     fireEvent.change(editor, { target: { value: 'Edited source' } })
 
     await waitFor(() =>
-      expect(setSourceText).toHaveBeenCalledWith('editable', 'Edited source', null),
+      expect(setSourceText).toHaveBeenCalledWith('editable', 'Edited source', expect.any(String)),
     )
     expect(setTranslation).not.toHaveBeenCalled()
   })
@@ -2133,7 +2567,11 @@ describe('canvas interaction adapter', () => {
     fireEvent.keyDown(editor, { key: 'Escape' })
 
     await waitFor(() =>
-      expect(setTranslation).toHaveBeenCalledWith('editable', 'Persisted while typing', null),
+      expect(setTranslation).toHaveBeenCalledWith(
+        'editable',
+        'Persisted while typing',
+        expect.any(String),
+      ),
     )
     expect(screen.getByTestId('inline-text-editor')).toHaveValue('Persisted while typing')
     fireEvent.blur(editor)
@@ -2301,7 +2739,7 @@ describe('canvas interaction adapter', () => {
       value: () => ({ x: 10, y: 20, width: 800, height: 600 }),
     })
 
-    const rotate = document.querySelector<HTMLElement>('[data-rotate-handle]')!
+    let rotate = document.querySelector<HTMLElement>('[data-rotate-handle]')!
     expect(screen.queryByTestId('rotation-angle-indicator')).not.toBeInTheDocument()
     fireEvent.pointerDown(rotate, { button: 0, pointerId: 11, clientX: 70, clientY: 40 })
     expect(screen.getByTestId('rotation-angle-indicator')).toHaveTextContent('0°')
@@ -2319,7 +2757,9 @@ describe('canvas interaction adapter', () => {
         }),
       ]),
     )
+    transitionCanvasGeneration(2, 2)
 
+    rotate = document.querySelector<HTMLElement>('[data-rotate-handle]')!
     fireEvent.pointerDown(rotate, { button: 0, pointerId: 12, clientX: 70, clientY: 40 })
     expect(screen.getByTestId('rotation-angle-indicator')).toBeInTheDocument()
     fireEvent.pointerCancel(rotate, { pointerId: 12 })
@@ -2343,6 +2783,7 @@ describe('canvas interaction adapter', () => {
             id: 'content',
             source: { text: 'Source', language: 'en' },
             translation: { text: 'Rendered', language: null },
+            translation_complete: true,
             role: null,
             source_region: null,
           },

@@ -38,6 +38,43 @@ impl StageRunner {
         let page = job.input.page();
         let model = self.stages.model(job.stage).to_owned();
         let outcome = self.run_with_recovery(&job, &model).await;
+        match &outcome {
+            Ok(StageOutcome::Stopped) => tracing::info!(
+                event = "pipeline_stage_finished",
+                page = %page,
+                stage = %job.stage,
+                model,
+                duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                cancellation_reason = job.stop.cancellation_reason().unwrap_or("unknown"),
+                result = "cancelled",
+            ),
+            Ok(StageOutcome::Skipped) => tracing::info!(
+                event = "pipeline_stage_finished",
+                page = %page,
+                stage = %job.stage,
+                model,
+                duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                result = "skipped",
+            ),
+            Ok(StageOutcome::Patch(_)) => tracing::info!(
+                event = "pipeline_stage_finished",
+                page = %page,
+                stage = %job.stage,
+                model,
+                duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                result = "output_ready",
+            ),
+            Err(error) => tracing::error!(
+                event = "pipeline_stage_failed",
+                page = %page,
+                stage = %job.stage,
+                model,
+                duration_ms = started.elapsed().as_secs_f64() * 1000.0,
+                kind = ?error.kind,
+                error = %error,
+                result = "failed",
+            ),
+        }
         StageCompletion {
             page,
             stage: job.stage,
@@ -45,6 +82,11 @@ impl StageRunner {
             elapsed: started.elapsed(),
             outcome,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn should_skip(&self, stage: Stage, input: &StageInput) -> Result<bool> {
+        self.stages.skip(stage, input)
     }
 
     async fn run_with_recovery(
@@ -68,7 +110,11 @@ impl StageRunner {
         if skip {
             return Ok(StageOutcome::Skipped);
         }
-        let permit = self.accelerator.acquire().await;
+        let permit = tokio::select! {
+            biased;
+            () = job.stop.cancelled() => return Ok(StageOutcome::Stopped),
+            permit = self.accelerator.acquire() => permit,
+        };
         if job.stop.stopped() {
             return Ok(StageOutcome::Stopped);
         }
@@ -83,7 +129,11 @@ impl StageRunner {
         tracing::warn!(stage = %job.stage, page = %job.input.page(), error = %failure.error, "retrying stage after memory pressure");
         let _metric =
             tracing::info_span!(target: "norrix_metrics", "stage_retry", stage = %job.stage, model);
-        let _permit = self.accelerator.recover(job.stage, &self.stages).await;
+        let _permit = tokio::select! {
+            biased;
+            () = job.stop.cancelled() => return Ok(StageOutcome::Stopped),
+            permit = self.accelerator.recover(job.stage, &self.stages) => permit,
+        };
         if job.stop.stopped() {
             return Ok(StageOutcome::Stopped);
         }
@@ -106,13 +156,16 @@ impl StageRunner {
                 model: model.to_owned(),
             },
         );
-        self.stages
-            .load(job.stage)
-            .await
-            .map_err(|error| AttemptFailure {
-                kind: ErrorKind::ModelLoad,
-                error,
-            })?;
+        tokio::select! {
+            biased;
+            () = job.stop.cancelled() => return Ok(StageOutcome::Stopped),
+            result = self.stages.load(job.stage) => {
+                result.map_err(|error| AttemptFailure {
+                    kind: ErrorKind::ModelLoad,
+                    error,
+                })?;
+            }
+        }
         if job.stop.stopped() {
             return Ok(StageOutcome::Stopped);
         }
@@ -124,28 +177,37 @@ impl StageRunner {
                 model: model.to_owned(),
             },
         );
-        self.stages
-            .process(job.stage, job.input.clone())
-            .await
-            .map(|patch| {
-                if patch.is_empty() {
-                    StageOutcome::Skipped
-                } else {
-                    StageOutcome::Patch(patch)
-                }
-            })
-            .map_err(|error| AttemptFailure {
-                kind: ErrorKind::Processing,
-                error,
-            })
+        tokio::select! {
+            biased;
+            () = job.stop.cancelled() => Ok(StageOutcome::Stopped),
+            result = self.stages.process(job.stage, job.input.clone()) => {
+                result
+                    .map(|patch| {
+                        if patch.is_empty() {
+                            StageOutcome::Skipped
+                        } else {
+                            StageOutcome::Patch(patch)
+                        }
+                    })
+                    .map_err(|error| AttemptFailure {
+                        kind: ErrorKind::Processing,
+                        error,
+                    })
+            }
+        }
     }
 
     fn stage_error(&self, stage: Stage, model: &str, failure: AttemptFailure) -> PipelineError {
         self.stages.unload(stage);
-        let message = match failure.kind {
+        let mut message = match failure.kind {
             ErrorKind::ModelLoad => format!("failed to load {model}"),
             _ => format!("{model} failed"),
         };
+        if stage == Stage::Translation {
+            message.push_str(
+                "; segments without persisted translations remain pending and can be retried",
+            );
+        }
         PipelineError::new(failure.kind, Some(stage), failure.error.context(message))
     }
 }

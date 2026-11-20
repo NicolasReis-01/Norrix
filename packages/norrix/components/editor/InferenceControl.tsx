@@ -17,7 +17,13 @@ import { useTranslation } from 'react-i18next'
 import { ModelPicker } from '@/components/controls/ModelPicker'
 import { OutputPicker, type OutputDraft } from '@/components/controls/OutputPicker'
 import { call, refreshTranslationModels, savePreferences } from '@/lib/backend'
-import { pipelineStages, receivePreferences, useNorrixStore, type PipelineScope } from '@/lib/store'
+import {
+  pipelineStages,
+  receiveError,
+  receivePreferences,
+  useNorrixStore,
+  type PipelineScope,
+} from '@/lib/store'
 import { modelKey, providerName } from '@/lib/translation'
 import {
   commands,
@@ -51,7 +57,9 @@ export function InferenceControl({
 
   const stop = () => {
     if (!running) return
-    void call(commands.stopJob, running.id).catch(() => undefined)
+    void call(commands.stopJob, running.id).catch((error: unknown) =>
+      receiveError(error instanceof Error ? error.message : String(error)),
+    )
   }
 
   return (
@@ -146,7 +154,7 @@ function RuntimeSelector({
         model: next,
       },
     }
-    void savePreferences(pipeline, preferences.providers, preferences.typesetting)
+    void savePreferences(pipeline, preferences.providers, preferences.typesetting, preferences.view)
       .then((saved) => {
         receivePreferences(saved)
       })
@@ -170,7 +178,7 @@ function RuntimeSelector({
         instructions: draft.instructions || null,
       },
     }
-    void savePreferences(pipeline, preferences.providers, preferences.typesetting)
+    void savePreferences(pipeline, preferences.providers, preferences.typesetting, preferences.view)
       .then((saved) => {
         receivePreferences(saved)
       })

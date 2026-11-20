@@ -92,6 +92,7 @@ const textLayer: Extract<Layer, { type: 'text' }> = {
     id: 'geometry-text',
     source: { text: 'Hi', language: 'en' },
     translation: { text: 'Hi', language: 'en' },
+    translation_complete: true,
     role: null,
     source_region: null,
   },

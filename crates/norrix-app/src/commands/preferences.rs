@@ -1,6 +1,7 @@
 use std::fmt;
 
 use anyhow::Result;
+use norrix_config::load;
 use norrix_pipeline::PipelineConfig;
 use norrix_renderer::TypesettingConfig;
 use norrix_secrets::ExposeSecret as _;
@@ -15,7 +16,24 @@ pub struct Preferences {
     pub pipeline: PipelineConfig,
     pub providers: ProviderPreferences,
     pub typesetting: TypesettingConfig,
+    pub view: ViewPreferences,
     pub languages: Vec<LanguageChoice>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Type)]
+#[serde(rename_all = "snake_case")]
+pub enum DetectionOutlineMode {
+    Never,
+    #[default]
+    Selected,
+    Always,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize, Type)]
+#[serde(default)]
+pub struct ViewPreferences {
+    pub text_box_outlines: bool,
+    pub detection_outlines: DetectionOutlineMode,
 }
 
 impl Preferences {
@@ -23,13 +41,16 @@ impl Preferences {
         let pipeline = PipelineConfig::load()?;
         let providers = ProvidersConfig::load()?;
         let typesetting = TypesettingConfig::load()?;
+        let view = load::<ViewPreferences>("view")?;
         let pipeline = pipeline.read()?;
         let providers = providers.read()?;
         let typesetting = typesetting.read()?;
+        let view = view.read()?;
         Ok(Self {
             pipeline: pipeline.clone(),
             providers: ProviderPreferences::from_config(&providers)?,
             typesetting: typesetting.clone(),
+            view: *view,
             languages: Language::ALL
                 .iter()
                 .map(|language| LanguageChoice {
@@ -141,7 +162,7 @@ impl CredentialInput {
                 if value.trim().is_empty() {
                     norrix_translator::clear_gemini_api_keys()?;
                 } else {
-                    norrix_translator::set_gemini_primary_api_key(value.into())?;
+                    norrix_translator::add_gemini_api_key(value.into())?;
                 }
             }
             return Ok(());
@@ -177,12 +198,14 @@ pub(crate) async fn save_preferences(
     mut pipeline: PipelineConfig,
     providers: ProviderPreferences,
     typesetting: TypesettingConfig,
+    view: ViewPreferences,
 ) -> std::result::Result<Preferences, Error> {
     remember_pipeline_profiles(&mut pipeline);
     let providers = providers.into_config()?;
     let pipeline_config = PipelineConfig::load()?;
     let providers_config = ProvidersConfig::load()?;
     let typesetting_config = TypesettingConfig::load()?;
+    let view_config = load::<ViewPreferences>("view")?;
     {
         let mut current = pipeline_config.write()?;
         *current = pipeline;
@@ -196,6 +219,11 @@ pub(crate) async fn save_preferences(
     {
         let mut current = typesetting_config.write()?;
         *current = typesetting;
+        current.save()?;
+    }
+    {
+        let mut current = view_config.write()?;
+        *current = view;
         current.save()?;
     }
     let preferences = Preferences::load()?;
@@ -239,30 +267,41 @@ pub(crate) async fn get_gemini_api_keys()
 
 #[tauri::command]
 #[specta::specta]
-pub(crate) async fn set_gemini_primary_key(
+pub(crate) async fn set_gemini_api_key_manual_status(
+    id: String,
+    status: Option<norrix_translator::GeminiApiKeyManualStatus>,
+) -> std::result::Result<Vec<norrix_translator::GeminiApiKeyInfo>, Error> {
+    Ok(norrix_translator::set_gemini_api_key_manual_status(
+        &id, status,
+    )?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) async fn add_gemini_api_key(
     key: String,
 ) -> std::result::Result<Vec<norrix_translator::GeminiApiKeyInfo>, Error> {
-    Ok(norrix_translator::set_gemini_primary_api_key_with_info(
+    Ok(norrix_translator::add_gemini_api_key_with_info(key.into())?)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub(crate) async fn replace_gemini_api_key(
+    id: String,
+    key: String,
+) -> std::result::Result<Vec<norrix_translator::GeminiApiKeyInfo>, Error> {
+    Ok(norrix_translator::replace_gemini_api_key_with_info(
+        &id,
         key.into(),
     )?)
 }
 
 #[tauri::command]
 #[specta::specta]
-pub(crate) async fn add_gemini_secondary_key(
-    key: String,
-) -> std::result::Result<Vec<norrix_translator::GeminiApiKeyInfo>, Error> {
-    Ok(norrix_translator::add_gemini_secondary_api_key_with_info(
-        key.into(),
-    )?)
-}
-
-#[tauri::command]
-#[specta::specta]
-pub(crate) async fn remove_gemini_secondary_key(
+pub(crate) async fn remove_gemini_api_key(
     id: String,
 ) -> std::result::Result<Vec<norrix_translator::GeminiApiKeyInfo>, Error> {
-    Ok(norrix_translator::remove_gemini_secondary_api_key_with_info(&id)?)
+    Ok(norrix_translator::remove_gemini_api_key_with_info(&id)?)
 }
 
 #[tauri::command]

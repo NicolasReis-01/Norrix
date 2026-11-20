@@ -3,12 +3,7 @@ name: Release
 on:
   push:
     tags:
-      - '*'
-
-permissions:
-  contents: write
-  id-token: write
-  packages: write
+      - '[0-9]*.[0-9]*.[0-9]*'
 
 env:
   CARGO_TERM_COLOR: always
@@ -16,7 +11,56 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release tag and source branch
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          if [[ ! "$RELEASE_TAG" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag is not a supported semantic version."
+            exit 1
+          fi
+
+          version=$(awk '
+            /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && /^version = / {
+              sub(/^version = "/, "")
+              sub(/"$/, "")
+              print
+              exit
+            }
+          ' Cargo.toml)
+          if [[ "$RELEASE_TAG" != "$version" ]]; then
+            echo "Release tag does not match the workspace version."
+            exit 1
+          fi
+
+          git fetch --no-tags origin +refs/heads/main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$RELEASE_SHA" refs/remotes/origin/main; then
+            echo "Release commit is not reachable from main."
+            exit 1
+          fi
+          if ! git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            echo "Release tag is not present in the checkout."
+            exit 1
+          fi
+          tag_sha=$(git rev-parse "refs/tags/$RELEASE_TAG^{commit}")
+          if [[ "$tag_sha" != "$RELEASE_SHA" ]]; then
+            echo "Release tag does not resolve to the triggering commit."
+            exit 1
+          fi
+
       - name: Remove incomplete release uploads
         shell: bash
         env:
@@ -39,6 +83,8 @@ jobs:
 
   release:
     needs: prepare
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -49,19 +95,19 @@ jobs:
             args: ''
           - platform: 'ubuntu-24.04-arm'
             args: ''
-          - platform: 'windows-latest'
-            args: ''
 
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
         with:
+          ref: ${{ github.sha }}
           fetch-depth: 0
           fetch-tags: true
+          persist-credentials: false
 
-      - uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
 
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
         with:
           shared-key: norrix-app-${{ matrix.platform }}
           # Main-branch builds own the shared dependency cache.
@@ -86,7 +132,7 @@ jobs:
             libayatana-appindicator3-dev \
             librsvg2-dev
 
-      - uses: actions/cache@v6
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
         with:
           path: ~/.bun/install/cache
           key: ${{ matrix.platform }}-bun-${{ hashFiles('**/bun.lock') }}
@@ -105,14 +151,6 @@ jobs:
             bun git-cliff --current --strip all
             echo 'EOF'
           } >> "$GITHUB_OUTPUT"
-
-      - name: Install trusted-signing-cli (windows only)
-        if: startsWith(matrix.platform, 'windows')
-        shell: bash
-        run: |
-          curl -fsSL "https://github.com/Levminer/trusted-signing-cli/releases/download/0.8.0/trusted-signing-cli.exe" -o "$RUNNER_TEMP/trusted-signing-cli.exe"
-          printf '%s\n' "$RUNNER_TEMP" >> "$GITHUB_PATH"
-          "$RUNNER_TEMP/trusted-signing-cli.exe" --version
 
       - name: Import Apple Developer Certificate
         if: startsWith(matrix.platform, 'macos')
@@ -138,17 +176,95 @@ jobs:
           echo "CERT_ID=$CERT_ID" >> $GITHUB_ENV
           echo "Certificate imported."
 
-      - uses: tauri-apps/tauri-action@v1
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
         env:
           # Tauri's quick-sharun fork still needs anylinux.c, removed from upstream main.
           ANYLINUX_LIB_SOURCE: https://raw.githubusercontent.com/FabianLars/Anylinux-AppImages/3e280d1b2270fecfcb2c2c823b490c782ecf1277/useful-tools/lib/anylinux.c
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM }}
-          APPLE_CERTIFICATE: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+          APPLE_ID: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_ID || '' }}
+          APPLE_PASSWORD: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_PASSWORD || '' }}
+          APPLE_TEAM_ID: ${{ startsWith(matrix.platform, 'macos') && secrets.APPLE_TEAM || '' }}
+          APPLE_CERTIFICATE: ${{ startsWith(matrix.platform, 'macos') && secrets.BUILD_CERTIFICATE_BASE64 || '' }}
           APPLE_CERTIFICATE_PASSWORD: ""
-          APPLE_SIGNING_IDENTITY: ${{ env.CERT_ID }}
+          APPLE_SIGNING_IDENTITY: ${{ startsWith(matrix.platform, 'macos') && env.CERT_ID || '' }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+          NEXT_PUBLIC_SENTRY_DSN: ${{ secrets.NEXT_PUBLIC_SENTRY_DSN }}
+          SENTRY_AUTH_TOKEN: ${{ secrets.SENTRY_AUTH_TOKEN }}
+        with:
+          tauriScript: cargo tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: ${{ github.ref_name }}
+          releaseBody: ${{ steps.release_notes.outputs.release_body }}
+          releaseDraft: false
+          prerelease: false
+          retryAttempts: 3
+          args: ${{ matrix.args }}
+
+  release-windows:
+    needs: prepare
+    runs-on: windows-latest
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          fetch-tags: true
+          persist-credentials: false
+
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        with:
+          shared-key: norrix-app-windows-latest
+          save-if: false
+
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6
+        with:
+          path: ~/.bun/install/cache
+          key: windows-latest-bun-${{ hashFiles('**/bun.lock') }}
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Generate release changelog
+        id: release_notes
+        shell: bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          {
+            echo 'release_body<<EOF'
+            bun git-cliff --current --strip all
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Install trusted-signing-cli
+        shell: pwsh
+        run: |
+          $artifact = Join-Path $env:RUNNER_TEMP 'trusted-signing-cli.exe'
+          curl.exe -fsSL 'https://github.com/Levminer/trusted-signing-cli/releases/download/0.8.0/trusted-signing-cli.exe' -o $artifact
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Could not download trusted-signing-cli.'
+          }
+
+          $expectedHash = '39ece56f51f41eaf208cdf95323830cfa9e0a64c974ea9de8a27d82113d6e007'
+          $actualHash = (Get-FileHash -LiteralPath $artifact -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualHash -ne $expectedHash) {
+            throw 'trusted-signing-cli SHA-256 verification failed.'
+          }
+
+          Add-Content -Path $env:GITHUB_PATH -Value $env:RUNNER_TEMP
+          & $artifact --version
+          if ($LASTEXITCODE -ne 0) {
+            throw 'trusted-signing-cli did not report its version successfully.'
+          }
+
+      - uses: tauri-apps/tauri-action@1deb371b0cd8bd54025b384f1cd735e725c4060f # v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
           AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
           AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
@@ -163,13 +279,15 @@ jobs:
           releaseDraft: false
           prerelease: false
           retryAttempts: 3
-          args: ${{ matrix.args }}
+          args: ''
 
   winget:
-    needs: release
+    needs: [release, release-windows]
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
-      - uses: vedantmgoyal9/winget-releaser@main
+      - uses: vedantmgoyal9/winget-releaser@b7370d4d152efdce803a26cc6ca9eee58cb2ad54
         with:
           identifier: mayocream.norrix
           version: ${{ github.ref_name }}

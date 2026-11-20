@@ -11,10 +11,10 @@ use futures::future::try_join_all;
 use norrix_rasterizer::{RasterOptions, Rasterizer};
 use norrix_scene::{
     Asset, AssetRole, BlobId, Change, Component, ComponentOwner, EntityChange, EntityId, FitsTo,
-    FlowsIn, Geometry, Group, OcrAnalysis, Origin, Page, Presents, RasterLayer, RasterLayerKind,
-    RecognizedFrom, Region, RelationChange, RelationId, RelationSpec, Revision, Snapshot,
-    TextAlignment, TextDirection, TextLayout as SceneTextLayout, TextLayoutKind, Translation,
-    Typography, Visibility,
+    FlowsIn, Geometry, Group, OcrAnalysis, Origin, OriginalFontEstimate, Page, Presents,
+    RasterLayer, RasterLayerKind, RecognizedFrom, Region, RelationChange, RelationId, RelationSpec,
+    Revision, Snapshot, TextAlignment, TextDirection, TextLayout as SceneTextLayout,
+    TextLayoutKind, Translation, Typography, Visibility,
 };
 use parking_lot::Mutex;
 use rayon::prelude::*;
@@ -832,6 +832,8 @@ impl Traversal<'_> {
             )
         };
         let typography = self.snapshot.component::<Typography>(entity)?;
+        dependencies.insert(component_dependency::<OriginalFontEstimate>(entity));
+        let original_font_estimate = self.snapshot.component::<OriginalFontEstimate>(entity)?;
         let analysis =
             if let Some(recognized) = self.snapshot.relation_from::<RecognizedFrom>(content)? {
                 dependencies.insert(RenderDependency::Relation(recognized.id()));
@@ -874,7 +876,17 @@ impl Traversal<'_> {
                 .as_ref()
                 .and_then(|value| value.font_style)
                 .map(Into::into),
-            font_size: typography.as_ref().and_then(|value| value.size),
+            font_size: typography
+                .as_ref()
+                .and_then(|value| value.size)
+                .or_else(|| {
+                    typography
+                        .as_ref()
+                        .filter(|value| matches!(value.origin, Origin::Generated(_)))
+                        .and(original_font_estimate.as_ref())
+                        .map(|estimate| estimate.size)
+                }),
+            auto_fit_size: typography.as_ref().and_then(|value| value.auto_fit_size),
             minimum_font_size: MINIMUM_FONT_SIZE,
             auto_fit: typography.as_ref().is_none_or(|value| value.auto_fit),
             alignment,
@@ -1753,8 +1765,9 @@ mod tests {
     use std::{collections::BTreeMap, io::Cursor};
 
     use norrix_scene::{
-        AssetInput, AssetMetadata, At, Authored, BubbleRegion, Generation, PageDraft, ProducerId,
-        Session, SourceText, TextLayout as SceneTextLayout, TextLayoutKind,
+        AssetInput, AssetMetadata, At, Authored, BubbleRegion, Generation, Geometry, Origin,
+        OriginalFontEstimate, PageDraft, ProducerId, Session, SourceText,
+        TextLayout as SceneTextLayout, TextLayoutKind, Translation, Typography,
     };
 
     use super::*;
@@ -1779,6 +1792,110 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn detected_original_font_estimate_is_used_on_first_render_and_manual_size_wins() {
+        let mut session = Session::memory().await.unwrap();
+        let mut edit = session.snapshot().edit();
+        let page = edit
+            .add_page(PageDraft::new("font estimate", 220.0, 120.0), At::End)
+            .unwrap();
+        let snapshot = session
+            .commit(edit.finish().unwrap())
+            .await
+            .unwrap()
+            .snapshot;
+
+        let generation =
+            Generation::new(ProducerId::new("dev.koharu.pipeline.translation").unwrap());
+        let mut edit = snapshot.edit_as(generation.clone());
+        let content = edit.add_text_content(page, At::End).unwrap();
+        edit.set(
+            content,
+            &SourceText {
+                text: Authored::generated("original".to_owned(), generation.clone()),
+                language: None,
+            },
+        )
+        .unwrap();
+        edit.set(
+            content,
+            &Translation {
+                text: Authored::generated("Hi".to_owned(), generation.clone()),
+                language: None,
+            },
+        )
+        .unwrap();
+        let layer = edit
+            .add_text_layer(
+                page,
+                At::End,
+                content,
+                &SceneTextLayout {
+                    origin: Origin::Generated(generation.clone()),
+                    kind: TextLayoutKind::Paragraph,
+                    angle_degrees: None,
+                },
+            )
+            .unwrap();
+        edit.set(layer, &Geometry::rectangle(20.0, 20.0, 180.0, 80.0))
+            .unwrap();
+        edit.set(
+            layer,
+            &Typography {
+                origin: Origin::Generated(generation.clone()),
+                preferred_font: None,
+                font_weight: None,
+                font_style: None,
+                size: None,
+                auto_fit: true,
+                auto_fit_size: None,
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                alignment: None,
+                writing_mode: None,
+                line_height: None,
+                letter_spacing: None,
+                extensions: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        edit.set(
+            layer,
+            &OriginalFontEstimate {
+                origin: Origin::Generated(generation),
+                size: 15.0,
+            },
+        )
+        .unwrap();
+        let snapshot = session
+            .commit(edit.finish().unwrap())
+            .await
+            .unwrap()
+            .snapshot;
+        let renderer = Renderer::default();
+        let first = renderer
+            .preview_text_layout(&snapshot, page, layer, "Hi".to_owned())
+            .await
+            .unwrap();
+        assert!((first.font_size - 15.0).abs() < 0.1);
+
+        let mut typography = snapshot.component::<Typography>(layer).unwrap().unwrap();
+        typography.origin = Origin::User;
+        typography.size = Some(19.0);
+        typography.auto_fit = false;
+        let snapshot = session
+            .commit(snapshot.patch(|edit| edit.set(layer, &typography)).unwrap())
+            .await
+            .unwrap()
+            .snapshot;
+        let manual = renderer
+            .preview_text_layout(&snapshot, page, layer, "Hi".to_owned())
+            .await
+            .unwrap();
+        assert!((manual.font_size - 19.0).abs() < 0.1);
+    }
+
     #[test]
     fn user_writing_mode_overrides_language_default() {
         let mut typography = Typography {
@@ -1788,6 +1905,7 @@ mod tests {
             font_style: None,
             size: None,
             auto_fit: true,
+            auto_fit_size: None,
             color: None,
             stroke_color: None,
             stroke_width: None,
@@ -1826,6 +1944,7 @@ mod tests {
             font_style: None,
             size: None,
             auto_fit: true,
+            auto_fit_size: None,
             color: None,
             stroke_color: None,
             stroke_width: None,
@@ -1955,6 +2074,18 @@ mod tests {
         let commit = session.commit(translation).await.unwrap();
         let compiled = renderer.compile(&commit.snapshot, page).unwrap();
         assert!(compiled.layers.iter().any(|layer| layer.entity == text));
+
+        let updated = renderer
+            .update(&frame, &commit.snapshot, &commit.changes)
+            .await
+            .unwrap();
+        let rendered = updated
+            .layer(text)
+            .expect("translation update should retain the text layer");
+        let LayerKind::Text(metadata) = rendered.kind() else {
+            panic!("translated text layer should compile as text");
+        };
+        assert_eq!(metadata.text, "visible translation");
     }
 
     #[tokio::test]
@@ -2359,6 +2490,7 @@ mod tests {
                         font_style: None,
                         size: Some(20.0),
                         auto_fit: true,
+                        auto_fit_size: None,
                         color: None,
                         stroke_color: None,
                         stroke_width: None,
@@ -2501,6 +2633,131 @@ mod tests {
         assert!(
             first_path_x > 40.0,
             "preview path coordinates are local to the text layout box: {first_path_x}"
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_font_size_stays_fixed_on_axis_resize_and_refits_on_diagonal_resize() {
+        let mut session = Session::memory().await.unwrap();
+        let mut edit = session.snapshot().edit();
+        let page = edit
+            .add_page(PageDraft::new("resize", 400.0, 300.0), At::End)
+            .unwrap();
+        let content = edit.add_text_content(page, At::End).unwrap();
+        edit.set(
+            content,
+            &norrix_scene::SourceText {
+                text: Authored::user("A short line of text that needs wrapping".to_owned()),
+                language: None,
+            },
+        )
+        .unwrap();
+        edit.set(
+            content,
+            &Translation {
+                text: Authored::user("A short line of text that needs wrapping".to_owned()),
+                language: None,
+            },
+        )
+        .unwrap();
+        let text = edit
+            .add_text_layer(
+                page,
+                At::End,
+                content,
+                &SceneTextLayout {
+                    origin: Origin::User,
+                    kind: TextLayoutKind::Paragraph,
+                    angle_degrees: Some(0.0),
+                },
+            )
+            .unwrap();
+        edit.set(text, &Geometry::rectangle(20.0, 20.0, 80.0, 30.0))
+            .unwrap();
+        edit.set(
+            text,
+            &Typography {
+                origin: Origin::User,
+                preferred_font: None,
+                font_weight: None,
+                font_style: None,
+                size: None,
+                auto_fit: true,
+                auto_fit_size: None,
+                color: None,
+                stroke_color: None,
+                stroke_width: None,
+                alignment: None,
+                writing_mode: None,
+                line_height: None,
+                letter_spacing: None,
+                extensions: BTreeMap::new(),
+            },
+        )
+        .unwrap();
+        let snapshot = session
+            .commit(edit.finish().unwrap())
+            .await
+            .unwrap()
+            .snapshot;
+        let renderer = Renderer::default();
+        let rendered_size = |frame: &Frame| match frame.layer(text).unwrap().kind() {
+            LayerKind::Text(metadata) => metadata.font_size,
+            LayerKind::Image(_) => panic!("text layer rendered as an image"),
+        };
+        let original_size = rendered_size(&renderer.render(&snapshot, page).await.unwrap());
+        assert!(original_size >= 9.0);
+
+        let mut axis_snapshot = snapshot.clone();
+        for geometry in [
+            Geometry::rectangle(20.0, 20.0, 240.0, 30.0),
+            Geometry::rectangle(20.0, 20.0, 240.0, 120.0),
+        ] {
+            let mut typography = axis_snapshot
+                .component::<Typography>(text)
+                .unwrap()
+                .unwrap();
+            typography.auto_fit_size = Some(original_size);
+            let patch = axis_snapshot
+                .patch(|edit| {
+                    edit.set(text, &geometry)?;
+                    edit.set(text, &typography)
+                })
+                .unwrap();
+            axis_snapshot = session.commit(patch).await.unwrap().snapshot;
+            let actual = rendered_size(&renderer.render(&axis_snapshot, page).await.unwrap());
+            assert_eq!(actual, original_size);
+        }
+
+        let mut typography = axis_snapshot
+            .component::<Typography>(text)
+            .unwrap()
+            .unwrap();
+        typography.auto_fit_size = None;
+        let diagonal = axis_snapshot
+            .patch(|edit| {
+                edit.set(text, &Geometry::rectangle(20.0, 20.0, 320.0, 160.0))?;
+                edit.set(text, &typography)
+            })
+            .unwrap();
+        let diagonal = session.commit(diagonal).await.unwrap().snapshot;
+        let diagonal_size = rendered_size(&renderer.render(&diagonal, page).await.unwrap());
+        assert_ne!(diagonal_size, original_size);
+
+        let mut typography = diagonal.component::<Typography>(text).unwrap().unwrap();
+        typography.auto_fit = false;
+        typography.size = Some(19.0);
+        typography.auto_fit_size = None;
+        let manual = diagonal
+            .patch(|edit| {
+                edit.set(text, &Geometry::rectangle(20.0, 20.0, 60.0, 30.0))?;
+                edit.set(text, &typography)
+            })
+            .unwrap();
+        let manual = session.commit(manual).await.unwrap().snapshot;
+        assert_eq!(
+            rendered_size(&renderer.render(&manual, page).await.unwrap()),
+            19.0
         );
     }
 

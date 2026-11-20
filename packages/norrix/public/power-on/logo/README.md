@@ -1,2 +1,2 @@
-Add the complementary still logo image to this folder and configure its public
-URL in `packages/norrix/lib/power-on-config.ts`.
+The current Power On screen uses only a full-screen video and has no separate
+logo image. This directory intentionally contains no logo asset.

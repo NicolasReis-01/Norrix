@@ -1,7 +1,8 @@
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
+use tokio::sync::Notify;
 
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
@@ -82,16 +83,98 @@ impl Default for Request {
     }
 }
 
+#[derive(Default)]
+struct StopState {
+    stopped: AtomicBool,
+    changed: Notify,
+    reason: OnceLock<&'static str>,
+}
+
 #[derive(Clone, Default)]
-pub struct StopToken(Arc<AtomicBool>);
+pub struct StopToken(Arc<StopState>);
 
 impl StopToken {
     pub fn stop(&self) {
-        self.0.store(true, Ordering::Release);
+        self.stop_with_reason("unspecified");
+    }
+
+    pub fn stop_with_reason(&self, reason: &'static str) {
+        let _ = self.0.reason.set(reason);
+        if !self.0.stopped.swap(true, Ordering::AcqRel) {
+            self.0.changed.notify_waiters();
+        }
+    }
+
+    #[must_use]
+    pub fn cancellation_reason(&self) -> Option<&'static str> {
+        self.0.reason.get().copied()
     }
 
     #[must_use]
     pub fn stopped(&self) -> bool {
-        self.0.load(Ordering::Acquire)
+        self.0.stopped.load(Ordering::Acquire)
+    }
+
+    pub async fn cancelled(&self) {
+        let changed = self.0.changed.notified();
+        tokio::pin!(changed);
+        changed.as_mut().enable();
+        if self.stopped() {
+            return;
+        }
+        changed.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::StopToken;
+
+    #[tokio::test]
+    async fn cancellation_waiter_is_released_once_stopped() {
+        let stop = StopToken::default();
+        let waiting = stop.cancelled();
+        stop.stop();
+
+        tokio::time::timeout(Duration::from_millis(50), waiting)
+            .await
+            .expect("stop should wake cancellation waiters");
+        assert!(stop.stopped());
+    }
+
+    #[tokio::test]
+    async fn cancellation_waiter_observes_an_already_stopped_token() {
+        let stop = StopToken::default();
+        stop.stop_with_reason("user_requested");
+
+        tokio::time::timeout(Duration::from_millis(50), stop.cancelled())
+            .await
+            .expect("an already stopped token should not wait");
+        assert_eq!(stop.cancellation_reason(), Some("user_requested"));
+    }
+
+    #[test]
+    fn cancellation_reason_is_first_writer_wins() {
+        let stop = StopToken::default();
+        stop.stop_with_reason("user_requested");
+        stop.stop_with_reason("application_shutdown");
+        assert_eq!(stop.cancellation_reason(), Some("user_requested"));
+    }
+
+    #[test]
+    fn cancellation_sources_remain_distinguishable() {
+        let user_stop = StopToken::default();
+        user_stop.stop_with_reason("user_requested");
+
+        let window_close = StopToken::default();
+        window_close.stop_with_reason("window_close_requested");
+
+        assert_eq!(user_stop.cancellation_reason(), Some("user_requested"));
+        assert_eq!(
+            window_close.cancellation_reason(),
+            Some("window_close_requested")
+        );
     }
 }

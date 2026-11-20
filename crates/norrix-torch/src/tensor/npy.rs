@@ -204,8 +204,10 @@ impl crate::Tensor {
         for i in 0..zip.len() {
             let mut reader = zip.by_index(i).unwrap();
             let name = {
-                let name = reader.name();
-                name.strip_suffix(NPY_SUFFIX).unwrap_or(name).to_owned()
+                let name = reader.name()?;
+                name.strip_suffix(NPY_SUFFIX)
+                    .unwrap_or(name.as_ref())
+                    .to_owned()
             };
             let header = read_header(&mut reader)?;
             let header = Header::parse(&header)?;

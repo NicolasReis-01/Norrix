@@ -25,8 +25,9 @@ pub use change::{
 pub use component::{Component, ValidationContext};
 pub use components::{
     Asset, AssetInput, AssetMetadata, AssetRole, Authored, DetectionAnalysis, DetectionLabel,
-    EntityOrigin, FontStyle, Generation, Geometry, Group, LanguageTag, OcrAnalysis, Origin, Page,
-    PageDraft, Point, Project, RasterLayer, RasterLayerKind, Region, RegionKind, Relation,
+    EntityOrigin, FontStyle, Generation, Geometry, Group, LanguageTag, OcrAnalysis, Origin,
+    OriginalFontEstimate, Page, PageDraft, PipelineProgress, Point, ProgressKind, ProgressOrigin,
+    ProgressStatus, Project, RasterLayer, RasterLayerKind, Region, RegionKind, Relation,
     RelationKind, SourceText, TextAlignment, TextContent, TextDirection, TextGroup, TextLayout,
     TextLayoutKind, TextRole, Translation, Typography, Visibility, WritingMode,
 };

@@ -120,8 +120,10 @@ pub(crate) async fn get_canvas_resource(
 
 #[tauri::command]
 #[specta::specta]
+#[tracing::instrument(skip_all)]
 pub(crate) async fn prepare_canvas_page(
     page: EntityId,
+    trace_id: Option<String>,
     desktop: State<'_, Desktop>,
     project: State<'_, CurrentProject>,
 ) -> Result<Option<CanvasPagePreparation>, Error> {
@@ -133,7 +135,10 @@ pub(crate) async fn prepare_canvas_page(
         (snapshot, prepared_page)
     };
     let revision = snapshot.revision();
-    if !desktop.prepare_page(&snapshot, page).await? {
+    if !desktop
+        .prepare_page(&snapshot, page, trace_id.as_deref())
+        .await?
+    {
         return Ok(None);
     }
     let element_frames = desktop.page_element_frames(page, revision)?;
@@ -434,6 +439,20 @@ pub(crate) async fn commit_transform(
     if geometries.is_empty() {
         return Ok(None);
     }
+    let text_font_sizes = desktop.page_text_font_sizes(page, expected_revision)?;
+    let geometries = geometries
+        .into_iter()
+        .map(|(element, geometry, angle_degrees, diagonal_resize)| {
+            let font_size = text_font_sizes
+                .iter()
+                .find(|value| value.element == element)
+                .map(|value| value.font_size)
+                .with_context(|| {
+                    format!("canvas transform element {element} has no rendered font size")
+                })?;
+            Ok((element, geometry, angle_degrees, diagonal_resize, font_size))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
     let (commit, page) = {
         let mut project = project.project.lock().await;
         let project = project.as_mut().context("no project is open")?;

@@ -152,6 +152,21 @@ impl NormalizedScope {
         self.region
             .and_then(|(candidate, bounds)| (candidate == page).then_some(bounds))
     }
+
+    pub(crate) fn contains_entity(
+        &self,
+        snapshot: &Snapshot,
+        page: EntityId,
+        entity: EntityId,
+    ) -> Result<bool> {
+        contains_entity(
+            snapshot,
+            page,
+            self.entities.as_deref(),
+            self.region(page),
+            entity,
+        )
+    }
 }
 
 fn semantic_closure(snapshot: &Snapshot, mut entities: BTreeSet<EntityId>) -> BTreeSet<EntityId> {

@@ -28,7 +28,13 @@ pub struct StageOutput {
     pub patch: norrix_scene::Patch,
 }
 
+#[derive(Debug)]
+pub enum CommitResult {
+    Applied(norrix_scene::Snapshot),
+    Conflict,
+}
+
 #[async_trait]
 pub trait Committer: Send {
-    async fn commit(&mut self, output: StageOutput) -> Result<norrix_scene::Snapshot>;
+    async fn commit(&mut self, output: StageOutput) -> Result<CommitResult>;
 }

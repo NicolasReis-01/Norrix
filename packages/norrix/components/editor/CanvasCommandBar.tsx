@@ -31,7 +31,9 @@ export function CanvasCommandBar() {
         : stages.length === 1
           ? ({ operation: 'only', stage: stages[0]! } as const)
           : ({ operation: 'stages', stages } as const)
-    void call(commands.process, scope, operation).catch(() => undefined)
+    void call(commands.process, scope, operation).catch((error: unknown) =>
+      receiveError(error instanceof Error ? error.message : String(error)),
+    )
   }
 
   const selectWorkspaceMode = (mode: 'single' | 'infinite') => {

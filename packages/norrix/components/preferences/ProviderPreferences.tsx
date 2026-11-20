@@ -53,6 +53,7 @@ export function ProviderPreferences({
             title={entry.name}
             description={t(`providerDescriptions.${entry.config.provider}`)}
             align='start'
+            fullWidth={entry.config.provider === 'gemini'}
           >
             <div className='grid gap-2'>
               {entry.config.provider === 'gemini' && <GeminiKeyManager />}

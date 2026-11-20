@@ -38,6 +38,7 @@ pub(crate) struct TextNodeDescriptor {
     pub(crate) font_weight: Option<u16>,
     pub(crate) font_style: Option<FontStyle>,
     pub(crate) font_size: Option<f32>,
+    pub(crate) auto_fit_size: Option<f32>,
     pub(crate) minimum_font_size: f32,
     pub(crate) auto_fit: bool,
     pub(crate) alignment: TextAlign,
@@ -263,7 +264,9 @@ impl TextRenderer {
         if is_bubble_text && descriptor.writing_mode == WritingMode::Horizontal {
             layout = layout.with_hyphenation_policy(HyphenationPolicy::LastResort);
         }
-        let layout = if descriptor.auto_fit && !descriptor.point_text {
+        let layout = if let Some(size) = descriptor.auto_fit_size.filter(|_| descriptor.auto_fit) {
+            layout.with_font_size(size)
+        } else if descriptor.auto_fit && !descriptor.point_text {
             layout
                 .with_max_font_size(maximum)
                 .with_min_font_size(minimum)
@@ -800,6 +803,7 @@ mod tests {
             font_weight: None,
             font_style: None,
             font_size: Some(6.0),
+            auto_fit_size: None,
             minimum_font_size: 9.0,
             auto_fit: true,
             alignment: TextAlign::Center,

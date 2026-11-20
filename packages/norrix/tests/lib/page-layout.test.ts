@@ -5,10 +5,12 @@ import {
   adjacentPagesFor,
   canvasPageLayouts,
   ghostPageOffsets,
+  infiniteScrollTopForZoom,
   infiniteScrollTranslation,
   pageIndexAtScroll,
   pageSequenceHeight,
   residentPageIds,
+  visiblePageIds,
 } from '@/lib/page-layout'
 import type { CanvasPagePreparation, PageSummary } from '@norrix/bridge/protocol'
 
@@ -18,6 +20,12 @@ const pages: PageSummary[] = [1, 2, 3].map((number) => ({
   size: { width: 800, height: 1000 },
   source_asset: null,
   layer_count: 0,
+  detection_complete: false,
+  ocr_complete: false,
+  translation_complete: false,
+  inpainting_complete: false,
+  translated_texts: 0,
+  total_texts: 0,
 }))
 
 const prepared = Object.fromEntries(
@@ -46,6 +54,7 @@ describe('infinite page layout', () => {
 
   it('keeps pages resident and identifies adjacent pages without scroll thresholds', () => {
     expect(residentPageIds(pages, 0, 500, 1, 1)).toEqual(['page-1', 'page-2', 'page-3'])
+    expect(visiblePageIds(pages, 900, 300, 1, 1)).toEqual(['page-1', 'page-2'])
     expect(pageIndexAtScroll(pages, 999, 1, 1)).toBe(0)
     expect(pageIndexAtScroll(pages, 1000, 1, 1)).toBe(0)
     expect(pageIndexAtScroll(pages, 1000.25, 1, 1)).toBe(1)
@@ -62,6 +71,28 @@ describe('infinite page layout', () => {
     expect(translationX).toBe(0)
     expect(nextTop).toBe(previousBottom)
     expect(nextTop).toBeCloseTo(297.7)
+  })
+
+  it('preserves the document point at the viewport center while zooming', () => {
+    const scrollTop = 840
+    const viewportHeight = 600
+    const dpr = 2
+    const previousZoom = 1.25
+    const nextZoom = 2
+    const nextScrollTop = infiniteScrollTopForZoom(
+      scrollTop,
+      viewportHeight,
+      previousZoom,
+      nextZoom,
+      dpr,
+    )
+    const previousDocumentY = ((scrollTop + viewportHeight * 0.5) * dpr) / previousZoom
+    const nextDocumentY = ((nextScrollTop + viewportHeight * 0.5) * dpr) / nextZoom
+    expect(nextDocumentY).toBeCloseTo(previousDocumentY)
+  })
+
+  it('clamps a zoom anchor at the start of the page sequence', () => {
+    expect(infiniteScrollTopForZoom(0, 600, 2, 0.5, 1)).toBe(0)
   })
 
   it('references only immediate neighboring pages as ghost sources', () => {

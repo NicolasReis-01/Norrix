@@ -47,6 +47,8 @@ vi.mock('@norrix/bridge/canvas', () => ({
     adapter.fetchResource(generation, resource),
   activateCanvas: (canvas: unknown) => adapter.activate(canvas),
   cancelCanvasPrefetch: vi.fn(),
+  traceCanvas: vi.fn(),
+  withCanvasPreparation: (_canvas: unknown, prepare: () => Promise<unknown>) => prepare(),
 }))
 
 describe('canvas lifecycle', () => {
@@ -85,6 +87,22 @@ describe('canvas lifecycle', () => {
     await waitFor(() => expect(renderer.clear).toHaveBeenCalledOnce())
     expect(adapter.fetchManifest).toHaveBeenCalledOnce()
     expect(result.current.hasFrame).toBe(false)
+    expect(adapter.create).toHaveBeenCalledOnce()
+  })
+
+  it('retains the last frame when the target page temporarily has no revision', async () => {
+    const element = document.createElement('canvas')
+    const { result, rerender } = renderHook(
+      ({ revision, generation }) => useCanvas(element, revision, generation, 'next-page'),
+      { initialProps: { revision: 4 as number | null, generation: 7 } },
+    )
+    await waitFor(() => expect(result.current.status).toBe('ready'))
+
+    rerender({ revision: null, generation: 8 })
+
+    expect(renderer.clear).not.toHaveBeenCalled()
+    expect(result.current.hasFrame).toBe(true)
+    expect(result.current.status).toBe('switching')
   })
 
   it('requests and installs only resources reported missing by the canvas', async () => {

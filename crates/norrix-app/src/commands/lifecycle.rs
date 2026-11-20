@@ -244,12 +244,10 @@ async fn replace_project(handle: &AppHandle<CefRuntime>, opened: Project) -> Res
     let info = opened.info();
 
     handle.state::<AgentState>().reset().await;
-    let processing = handle.state::<Processing>();
-    for stop in processing.stops.lock().values() {
-        stop.stop();
+    {
+        let processing = handle.state::<Processing>();
+        cancel_pipeline_jobs(&processing, "project_replaced");
     }
-    processing.stops.lock().clear();
-    processing.jobs.lock().clear();
 
     let previous = {
         let current = handle.state::<CurrentProject>();
@@ -405,12 +403,10 @@ pub(crate) async fn delete_project(
 
 async fn close_current_project(handle: &AppHandle<CefRuntime>) -> Result<()> {
     handle.state::<AgentState>().reset().await;
-    let processing = handle.state::<Processing>();
-    for stop in processing.stops.lock().values() {
-        stop.stop();
+    {
+        let processing = handle.state::<Processing>();
+        cancel_pipeline_jobs(&processing, "project_closed");
     }
-    processing.stops.lock().clear();
-    processing.jobs.lock().clear();
     let previous = {
         let current = handle.state::<CurrentProject>();
         let mut current = current.project.lock().await;
@@ -423,6 +419,28 @@ async fn close_current_project(handle: &AppHandle<CefRuntime>) -> Result<()> {
     handle.state::<CanvasChannel>().channel.publish(result);
     handle.state::<ProjectChannel>().channel.publish(None);
     Ok(())
+}
+
+fn cancel_pipeline_jobs(processing: &Processing, reason: &'static str) {
+    let mut stops = processing.stops.lock();
+    for (job_id, stop) in stops.iter() {
+        tracing::info!(
+            target: "norrix_metrics",
+            event = "pipeline_job_cancellation_requested",
+            job_id = %job_id,
+            cancellation_reason = reason,
+            result = "requested",
+        );
+        tracing::info!(
+            event = "pipeline_job_cancellation_requested",
+            job_id = %job_id,
+            cancellation_reason = reason,
+            result = "requested",
+        );
+        stop.stop_with_reason(reason);
+    }
+    stops.clear();
+    processing.jobs.lock().clear();
 }
 
 #[tracing::instrument(

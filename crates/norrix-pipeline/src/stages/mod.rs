@@ -7,7 +7,9 @@ use std::{collections::BTreeSet, sync::Arc};
 
 use anyhow::Result;
 use async_trait::async_trait;
-use norrix_scene::{Edit, EntityId, Generation, Patch, ProducerId, Snapshot};
+use norrix_scene::{
+    Edit, EntityId, Generation, Patch, PipelineProgress, ProducerId, ProgressKind, Snapshot,
+};
 
 pub use detection::KoharuLayoutRFDetrSeg2XLConfig;
 pub use inpainting::{Flux2KleinConfig, RoremMixedConfig};
@@ -55,6 +57,18 @@ impl StageInput {
             self.region,
             entity,
         )
+    }
+
+    fn translation_complete(&self, entity: EntityId) -> Result<bool> {
+        let progress = self.scene.component::<PipelineProgress>(entity)?;
+        match progress.and_then(|value| value.status(ProgressKind::Translation)) {
+            Some(norrix_scene::ProgressStatus::Complete(_)) => Ok(true),
+            Some(norrix_scene::ProgressStatus::Pending(_)) => Ok(false),
+            None => Ok(self
+                .scene
+                .component::<norrix_scene::Translation>(entity)?
+                .is_some_and(|value| !value.text.value.trim().is_empty())),
+        }
     }
 }
 
@@ -104,6 +118,20 @@ impl Stages {
     }
 
     pub(crate) fn skip(&self, stage: Stage, input: &StageInput) -> Result<bool> {
+        let progress_kind = match stage {
+            Stage::Detection => Some(ProgressKind::Detection),
+            Stage::Ocr => Some(ProgressKind::Ocr),
+            Stage::Translation => None,
+            Stage::Inpainting => Some(ProgressKind::Inpainting),
+        };
+        if let Some(kind) = progress_kind
+            && input
+                .scene
+                .component::<PipelineProgress>(input.page)?
+                .is_some_and(|progress| progress.is_complete(kind))
+        {
+            return Ok(true);
+        }
         self.processor(stage).skip(input)
     }
 

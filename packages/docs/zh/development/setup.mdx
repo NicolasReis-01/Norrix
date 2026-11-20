@@ -24,8 +24,11 @@ Norrix 基于 Rust 1.97.1（2024 edition）、Bun 1.3.14 和 LLVM 22.1.8 开发�
 git clone https://github.com/koharu-rs/koharu.git Norrix
 cd Norrix
 bun install
+bun run setup:tauri-cli
 bun dev
 ```
+
+`bun install` 不会自动安装 Tauri CLI。只有在需要构建或运行桌面应用时，才需要显式执行此设置命令。
 
 `bun dev` 同时启动 Next.js UI 和 Tauri。它先用 wasm-pack 将 `norrix-canvas` 构建为 WASM 并输出到 `packages/bridge/src/wasm`，再监听 `norrix-canvas` 与 `norrix-rasterizer`，在变更时重新构建。成功构建后，Turbopack 会刷新浏览器客户端。debug 构建在 `http://127.0.0.1:4000` 暴露 CEF 远程调试。
 

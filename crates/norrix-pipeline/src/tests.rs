@@ -7,6 +7,107 @@ fn configuration_ignores_unknown_fields() {
 }
 
 #[tokio::test]
+async fn project_translation_scan_skips_completed_and_empty_pages() {
+    let pipeline = pipeline(TranslationConfig::default());
+    let mut session = norrix_scene::Session::memory().await.unwrap();
+    let mut edit = session.snapshot().edit();
+    let completed_page = edit
+        .add_page(
+            norrix_scene::PageDraft::new("completed", 100.0, 100.0),
+            norrix_scene::At::End,
+        )
+        .unwrap();
+    let content = edit
+        .add_text_content(completed_page, norrix_scene::At::End)
+        .unwrap();
+    edit.set(
+        content,
+        &norrix_scene::SourceText {
+            text: norrix_scene::Authored::user("source".to_owned()),
+            language: None,
+        },
+    )
+    .unwrap();
+    edit.set(
+        content,
+        &norrix_scene::Translation {
+            text: norrix_scene::Authored::user("translated".to_owned()),
+            language: None,
+        },
+    )
+    .unwrap();
+    let mut progress = norrix_scene::PipelineProgress::default();
+    progress.set(
+        norrix_scene::ProgressKind::Translation,
+        Some(norrix_scene::ProgressStatus::Complete(
+            norrix_scene::ProgressOrigin::Automatic,
+        )),
+    );
+    edit.set(content, &progress).unwrap();
+    edit.add_text_layer(
+        completed_page,
+        norrix_scene::At::End,
+        content,
+        &norrix_scene::TextLayout {
+            origin: norrix_scene::Origin::User,
+            kind: norrix_scene::TextLayoutKind::Paragraph,
+            angle_degrees: None,
+        },
+    )
+    .unwrap();
+    edit.add_page(
+        norrix_scene::PageDraft::new("empty", 100.0, 100.0),
+        norrix_scene::At::End,
+    )
+    .unwrap();
+    session.commit(edit.finish().unwrap()).await.unwrap();
+    let mut committer = RejectCommitter;
+    let skipped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let skipped_progress = skipped.clone();
+
+    let report = pipeline
+        .execute(
+            session.snapshot(),
+            Request {
+                operation: Operation::Only {
+                    stage: Stage::Translation,
+                },
+                scope: Scope::Project,
+                progress: Some(std::sync::Arc::new(move |event| {
+                    if matches!(event, Progress::Skipped { .. }) {
+                        skipped_progress.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                })),
+                ..Request::default()
+            },
+            &mut committer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.status, RunStatus::Completed);
+    assert_eq!(report.total, 2);
+    assert_eq!(skipped.load(std::sync::atomic::Ordering::Relaxed), 2);
+    let snapshot = session.snapshot();
+    assert_eq!(
+        snapshot
+            .component::<norrix_scene::Translation>(content)
+            .unwrap()
+            .unwrap()
+            .text
+            .value,
+        "translated"
+    );
+    assert!(
+        snapshot
+            .component::<norrix_scene::PipelineProgress>(content)
+            .unwrap()
+            .unwrap()
+            .is_complete(norrix_scene::ProgressKind::Translation)
+    );
+}
+
+#[tokio::test]
 async fn stop_is_a_successful_partial_result() {
     let pipeline = pipeline(Default::default());
     let stop = StopToken::default();
@@ -85,6 +186,79 @@ async fn stop_after_a_page_keeps_completed_progress() {
     assert_eq!(report.total, 2);
 }
 
+#[tokio::test]
+async fn completed_page_and_text_markers_resume_without_loading_models() {
+    let pipeline = pipeline(TranslationConfig::default());
+    let mut session = norrix_scene::Session::memory().await.unwrap();
+    let mut edit = session.snapshot().edit();
+    let page = edit
+        .add_page(
+            norrix_scene::PageDraft::new("processed", 100.0, 100.0),
+            norrix_scene::At::End,
+        )
+        .unwrap();
+    let content = edit.add_text_content(page, norrix_scene::At::End).unwrap();
+    edit.set(
+        content,
+        &norrix_scene::SourceText {
+            text: norrix_scene::Authored::user("source".to_owned()),
+            language: None,
+        },
+    )
+    .unwrap();
+    edit.add_text_layer(
+        page,
+        norrix_scene::At::End,
+        content,
+        &norrix_scene::TextLayout {
+            origin: norrix_scene::Origin::User,
+            kind: norrix_scene::TextLayoutKind::Paragraph,
+            angle_degrees: Some(0.0),
+        },
+    )
+    .unwrap();
+    let mut page_progress = norrix_scene::PipelineProgress::default();
+    for kind in [
+        norrix_scene::ProgressKind::Detection,
+        norrix_scene::ProgressKind::Ocr,
+        norrix_scene::ProgressKind::Inpainting,
+    ] {
+        page_progress.set(
+            kind,
+            Some(norrix_scene::ProgressStatus::Complete(
+                norrix_scene::ProgressOrigin::Manual,
+            )),
+        );
+    }
+    edit.set(page, &page_progress).unwrap();
+    let mut text_progress = norrix_scene::PipelineProgress::default();
+    text_progress.set(
+        norrix_scene::ProgressKind::Translation,
+        Some(norrix_scene::ProgressStatus::Complete(
+            norrix_scene::ProgressOrigin::Manual,
+        )),
+    );
+    edit.set(content, &text_progress).unwrap();
+    session.commit(edit.finish().unwrap()).await.unwrap();
+    let mut committer = RejectCommitter;
+
+    let report = pipeline
+        .execute(
+            session.snapshot(),
+            Request {
+                operation: Operation::Full,
+                ..Request::default()
+            },
+            &mut committer,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(report.status, RunStatus::Completed);
+    assert_eq!(report.completed, 4);
+    assert_eq!(report.total, 4);
+}
+
 struct RejectCommitter;
 
 fn pipeline(translation: TranslationConfig) -> Pipeline {
@@ -102,7 +276,7 @@ fn pipeline(translation: TranslationConfig) -> Pipeline {
 
 #[async_trait::async_trait]
 impl Committer for RejectCommitter {
-    async fn commit(&mut self, _output: StageOutput) -> anyhow::Result<norrix_scene::Snapshot> {
+    async fn commit(&mut self, _output: StageOutput) -> anyhow::Result<CommitResult> {
         anyhow::bail!("stopped execution must not commit")
     }
 }

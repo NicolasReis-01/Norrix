@@ -1,6 +1,6 @@
 use std::{
     cmp::Ordering,
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     io::Cursor,
     sync::{Arc, Mutex},
 };
@@ -231,7 +231,9 @@ fn remove_previous_regions(
     edit: &mut norrix_scene::Edit,
     generation: &Generation,
 ) -> Result<()> {
-    let mut remove = Vec::new();
+    let mut remove_regions = Vec::new();
+    let mut remove_contents = BTreeSet::new();
+    let mut remove_layers = BTreeSet::new();
     for entity in input.scene.descendants(input.page)? {
         let id = entity.id();
         if !input.contains_entity(id)? {
@@ -243,13 +245,47 @@ fn remove_previous_regions(
                 matches!(origin.origin, Origin::Generated(ref owner) if owner.producer == generation.producer)
             })
             && entity.component::<Region>()?.is_some();
-        if owned_region {
-            remove.push(id);
+        if !owned_region {
+            continue;
+        }
+        remove_regions.push(id);
+        if entity
+            .component::<Region>()?
+            .is_some_and(|region| region.kind == TextRegion::kind())
+        {
+            for relation in input.scene.relations_to_as::<RecognizedFrom>(id) {
+                let content = relation.value().source;
+                remove_contents.insert(content);
+                if let Some(group) = input.scene.page(input.page)?.text_group()? {
+                    for layer in group.text_layers()? {
+                        if layer.content()?.id() == content
+                            && (input.scene.component::<EntityOrigin>(layer.id())?
+                                .is_some_and(|origin| {
+                                    matches!(origin.origin, Origin::Generated(ref owner) if owner.producer == generation.producer)
+                                })
+                                || input.scene.component::<TextLayout>(layer.id())?
+                                    .is_some_and(|layout| matches!(layout.origin, Origin::Generated(ref owner) if owner.producer == generation.producer)))
+                        {
+                            remove_layers.insert(layer.id());
+                        }
+                    }
+                }
+            }
         }
     }
-    for entity in remove {
+    for entity in remove_regions {
         if input.scene.entity(entity).is_ok() {
             edit.remove_entity(entity, RemovePolicy::Cascade)?;
+        }
+    }
+    for entity in remove_layers {
+        if input.scene.entity(entity).is_ok() {
+            edit.remove_entity(entity, RemovePolicy::Cascade)?;
+        }
+    }
+    for content in remove_contents {
+        if input.scene.entity(content).is_ok() {
+            edit.remove_entity(content, RemovePolicy::Cascade)?;
         }
     }
     Ok(())
@@ -277,6 +313,40 @@ async fn write_page(
     }
     non_maximum_suppression(&mut detections, 0.5);
     sort_by_layout(&mut detections);
+
+    let detected_text_count = detections
+        .iter()
+        .filter(|detection| detection.label == "text")
+        .count();
+    let has_manual_text = if let Some(group) = input.scene.page(page)?.text_group()? {
+        let mut manual = false;
+        for layer in group.text_layers()? {
+            let entity_manual = input
+                .scene
+                .component::<EntityOrigin>(layer.id())?
+                .is_some_and(|origin| matches!(origin.origin, Origin::User));
+            let layout_manual = input
+                .scene
+                .component::<TextLayout>(layer.id())?
+                .is_some_and(|layout| matches!(layout.origin, Origin::User));
+            let layout_absent = input.scene.component::<TextLayout>(layer.id())?.is_none();
+            if entity_manual || layout_manual || layout_absent {
+                manual = true;
+            }
+        }
+        manual
+    } else {
+        false
+    };
+    tracing::info!(
+        event = "detection_text_box_selection_finished",
+        page = %page,
+        detected_box_count = detected_text_count,
+        persisted_box_count = detected_text_count,
+        manual_box_present = has_manual_text,
+        trd_state = if detected_text_count == 0 && !has_manual_text { "0/0" } else { "pending" },
+        result = "classified",
+    );
 
     let image = image.to_rgb8();
     let regions = write_regions(&input.scene, edit, page, &image, &detections, generation)
@@ -409,6 +479,7 @@ fn write_region<'a>(
             font_style: None,
             size: None,
             auto_fit: true,
+            auto_fit_size: None,
             color: inferred.map(|value| [value.color[0], value.color[1], value.color[2], u8::MAX]),
             stroke_color: inferred
                 .and_then(|value| value.stroke_color)
@@ -1839,18 +1910,20 @@ mod tests {
         distance_transform::Norm,
         morphology::{close, dilate},
     };
-    use norrix_ml::koharu_layout_rfdetr_seg_2xl::{KoharuLayoutDetection, KoharuLayoutMask};
+    use norrix_ml::koharu_layout_rfdetr_seg_2xl::{
+        KoharuLayoutDetection, KoharuLayoutDetections, KoharuLayoutMask,
+    };
     use norrix_scene::{
-        At, BubbleRegion, FitsTo, FlowsIn, Geometry, Inside, Origin, PageDraft, Session,
-        TextLayout, TextLayoutKind, TextRegion, Typography, WritingMode,
+        At, BubbleRegion, FitsTo, FlowsIn, Geometry, Inside, Origin, PageDraft, RecognizedFrom,
+        Region, Session, TextLayout, TextLayoutKind, TextRegion, Typography, WritingMode,
     };
 
     use super::{
         DIALOGUE_MASK_CONTAINMENT_THRESHOLD, DetectedRegion, DetectedText, DetectionModel,
         ImageSize, KoharuLayoutRFDetrSeg2XLConfig, MaskPixel, PageRegions, Processor, RegionOutput,
-        StageInput, StageProcessor, closed_mask_for, color_palette, generation, infer_typography,
-        layout_order, link_dialogue_regions, mask_containment, mask_for, mask_geometry,
-        non_maximum_suppression, normalize_text_color, write_region,
+        StageInput, StageProcessor, build_patch, closed_mask_for, color_palette, generation,
+        infer_typography, layout_order, link_dialogue_regions, mask_containment, mask_for,
+        mask_geometry, non_maximum_suppression, normalize_text_color, write_region,
     };
 
     #[test]
@@ -1904,6 +1977,69 @@ mod tests {
         );
 
         assert!(processor.skip(&input).unwrap());
+    }
+
+    #[tokio::test]
+    async fn generated_detection_output_applies_without_progress_authorship_conflict() {
+        let mut session = Session::memory().await.unwrap();
+        let mut page = None;
+        let patch = session
+            .snapshot()
+            .patch(|edit| {
+                page = Some(edit.add_page(PageDraft::new("detection", 100.0, 100.0), At::End)?);
+                Ok(())
+            })
+            .unwrap();
+        let snapshot = session.commit(patch).await.unwrap().snapshot;
+        let page = page.unwrap();
+        let input = StageInput::new(
+            snapshot,
+            page,
+            None,
+            None,
+            std::sync::Arc::new(crate::ImageCache::default()),
+            None,
+        );
+        let image = image::DynamicImage::ImageRgb8(RgbImage::new(16, 16));
+        let output = KoharuLayoutDetections {
+            detections: vec![detection("text", 1.0, [2.0, 2.0, 10.0, 10.0])],
+            image_width: 16,
+            image_height: 16,
+        };
+        let patch = build_patch(
+            &input,
+            &image,
+            output,
+            &generation(super::PRODUCER, super::MODEL_ID).unwrap(),
+        )
+        .await
+        .unwrap();
+        let snapshot = session.commit(patch).await.unwrap().snapshot;
+
+        let layers = snapshot
+            .page(page)
+            .unwrap()
+            .text_group()
+            .unwrap()
+            .unwrap()
+            .text_layers()
+            .unwrap()
+            .collect::<Vec<_>>();
+        assert_eq!(layers.len(), 1);
+        let content = layers[0].content().unwrap().id();
+        let region = snapshot
+            .relation_from::<RecognizedFrom>(content)
+            .unwrap()
+            .unwrap()
+            .value()
+            .target;
+        assert!(snapshot.component::<Region>(region).unwrap().is_some());
+        assert!(
+            snapshot
+                .component::<norrix_scene::PipelineProgress>(page)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]

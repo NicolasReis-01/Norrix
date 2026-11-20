@@ -31,7 +31,7 @@ export function StatusBar({ onZoomChange }: StatusBarProps) {
         <span className='w-9 shrink-0 text-right text-foreground tabular-nums'>{zoom}%</span>
       </div>
       <div className='flex-1' />
-      {page && (
+      {page?.size && (
         <span className='tabular-nums'>
           {page.size.width} × {page.size.height} px
         </span>

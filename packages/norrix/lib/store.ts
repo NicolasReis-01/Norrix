@@ -16,6 +16,15 @@ import type {
 } from '@norrix/bridge/protocol'
 import { toast } from '@norrix/ui/components/toast'
 
+function traceCanvasState(event: string, details: Record<string, unknown>): void {
+  if (process.env.NODE_ENV !== 'development') return
+  console.debug('[Norrix canvas]', event, {
+    timestamp: new Date().toISOString(),
+    monotonicMs: typeof performance === 'undefined' ? null : performance.now(),
+    ...details,
+  })
+}
+
 export type CanvasTool = 'select' | 'text' | 'draw' | 'eraser' | 'color_picker' | 'remove' | 'pan'
 export const MIN_BRUSH_DIAMETER = 1
 export const MAX_BRUSH_DIAMETER = 128
@@ -50,6 +59,7 @@ interface NorrixStore {
   downloads: Record<string, Download>
   camera: { zoom: number; translation: [number, number]; fitted: boolean }
   canvasPage: EntityId | null
+  canvasTraceId: string
   canvasRevision: number | null
   canvasGeneration: number
   canvasSize: [number, number]
@@ -109,6 +119,7 @@ export const useNorrixStore = create<NorrixStore>()((set) => ({
   downloads: {},
   camera: { zoom: 1, translation: [0, 0], fitted: true },
   canvasPage: null,
+  canvasTraceId: '',
   canvasRevision: null,
   canvasGeneration: 0,
   canvasSize: [0, 0],
@@ -178,6 +189,16 @@ export const useNorrixStore = create<NorrixStore>()((set) => ({
 }))
 
 export function receiveStartupState(state: StartupState): void {
+  const previous = useNorrixStore.getState()
+  traceCanvasState('navigation-state-replaced', {
+    operation: 'receiveStartupState',
+    page: state.canvas.page,
+    previousPage: previous.selectedPage,
+    revision: state.canvas.revision,
+    generation: state.canvas.generation,
+    result: 'startup-state-applied',
+    reason: 'startup initializes selection from the authoritative canvas',
+  })
   useNorrixStore.setState({
     initialized: true,
     startupError: null,
@@ -197,15 +218,57 @@ export function receiveStartupError(startupError: string): void {
 
 export function receiveCanvas(canvas: CanvasState): void {
   useNorrixStore.setState((state) => {
+    const previous = {
+      page: state.canvasPage,
+      revision: state.canvasRevision,
+      generation: state.canvasGeneration,
+    }
     const selectedPage =
       state.workspaceMode === 'single' || state.selectedPage === null
         ? canvas.page
         : state.selectedPage
-    return {
+    const update = {
       ...canvasSnapshot(canvas),
       selectedPage,
       selectedLayers: selectedPage ? (state.selectedLayersByPage[selectedPage] ?? []) : [],
     }
+    traceCanvasState('canvas-state-store-updated', {
+      traceId: canvas.trace_id,
+      previous,
+      received: {
+        page: canvas.page,
+        revision: canvas.revision,
+        generation: canvas.generation,
+      },
+      next: {
+        page: update.canvasPage,
+        revision: update.canvasRevision,
+        generation: update.canvasGeneration,
+        selectedPage: update.selectedPage,
+      },
+      decision: 'applied',
+      ordering:
+        canvas.generation < state.canvasGeneration
+          ? 'older-generation-applied'
+          : 'current-or-newer',
+    })
+    if (selectedPage !== state.selectedPage) {
+      traceCanvasState('navigation-state-changed', {
+        operation: 'receiveCanvas',
+        traceId: canvas.trace_id,
+        page: selectedPage,
+        previousPage: state.selectedPage,
+        revision: canvas.revision,
+        generation: canvas.generation,
+        workspaceMode: state.workspaceMode,
+        result: 'selected-page-updated',
+        reason:
+          state.workspaceMode === 'single'
+            ? 'single-page canvas event synchronizes active page'
+            : 'no selected page existed when canvas state arrived',
+      })
+    }
+    return update
   })
 }
 
@@ -234,13 +297,18 @@ export function receiveResources(resources: ModelResources): void {
   useNorrixStore.setState({ resources })
 }
 
-export function receiveError(message: string): void {
-  toast.add({ type: 'error', title: 'Could not complete that action', description: message })
+export function receiveError(message: string, title = 'Could not complete that action'): void {
+  toast.add({ type: 'error', title, description: message })
+}
+
+export function receiveInfo(message: string, title: string): void {
+  toast.add({ type: 'info', title, description: message })
 }
 
 function canvasSnapshot(canvas: CanvasState) {
   return {
     canvasPage: canvas.page,
+    canvasTraceId: canvas.trace_id,
     canvasRevision: canvas.revision,
     canvasGeneration: canvas.generation,
     canvasSize: canvas.size,

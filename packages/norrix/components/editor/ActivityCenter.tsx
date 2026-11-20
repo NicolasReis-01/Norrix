@@ -1,12 +1,12 @@
 'use client'
 
 import { useMutationState } from '@tanstack/react-query'
-import { CircleAlert, Download, LoaderCircle, Square, X } from 'lucide-react'
+import { Check, CircleAlert, Download, LoaderCircle, Square, X } from 'lucide-react'
 import { useTranslation } from 'react-i18next'
 
 import { call } from '@/lib/backend'
 import { usePages } from '@/lib/queries'
-import { useNorrixStore } from '@/lib/store'
+import { receiveError, useNorrixStore } from '@/lib/store'
 import { commands, type Download as DownloadState, type Job } from '@norrix/bridge/protocol'
 import { Button } from '@norrix/ui/components/button'
 
@@ -24,7 +24,11 @@ export function ActivityCenter() {
     (activity): activity is { id: number; label: string } => typeof activity.label === 'string',
   )
   const visibleJobs = Object.values(jobs).filter(
-    (job) => job.state === 'running' || job.state === 'failed',
+    (job) =>
+      job.state === 'running' ||
+      job.state === 'failed' ||
+      job.state === 'stopped' ||
+      job.state === 'finished',
   )
   const runningDownloads = Object.values(downloads).filter(
     (download) => download.state === 'running',
@@ -104,6 +108,10 @@ function DownloadGroup({ downloads }: { downloads: DownloadState[] }) {
 function JobItem({ job }: { job: Job }) {
   const { t } = useTranslation()
   const dismiss = useNorrixStore((state) => state.dismissJob)
+  const stop = () =>
+    void call(commands.stopJob, job.id).catch((error: unknown) =>
+      receiveError(error instanceof Error ? error.message : String(error)),
+    )
   // The pipeline reports which page it is on; the rail has already loaded the
   // labels, so this resolves from cache rather than fetching.
   const pages = usePages(job.page !== null).data
@@ -120,6 +128,42 @@ function JobItem({ job }: { job: Job }) {
         message={job.error || t('activity.processingFailed')}
         onDismiss={() => dismiss(job.id)}
       />
+    )
+  }
+  if (job.state === 'stopped') {
+    return (
+      <div className='grid grid-cols-[1rem_minmax(0,1fr)_1.5rem] items-start gap-x-2.5 border-b p-3 text-[11px] last:border-b-0'>
+        <Square className='mt-0.5 size-3 justify-self-center text-muted-foreground' />
+        <span className='min-w-0 text-muted-foreground'>{t('activity.processingCancelled')}</span>
+        <Button
+          size='icon-xs'
+          variant='ghost'
+          className='-mt-1'
+          aria-label={t('activity.dismiss')}
+          onClick={() => dismiss(job.id)}
+        >
+          <X />
+        </Button>
+      </div>
+    )
+  }
+  if (job.state === 'finished') {
+    return (
+      <div className='grid grid-cols-[1rem_minmax(0,1fr)_1.5rem] items-start gap-x-2.5 border-b p-3 text-[11px] last:border-b-0'>
+        <Check className='mt-0.5 size-3.5 justify-self-center text-primary' />
+        <span className='min-w-0 text-muted-foreground'>
+          {t('activity.processingComplete', { defaultValue: 'Processing complete.' })}
+        </span>
+        <Button
+          size='icon-xs'
+          variant='ghost'
+          className='-mt-1'
+          aria-label={t('activity.dismiss')}
+          onClick={() => dismiss(job.id)}
+        >
+          <X />
+        </Button>
+      </div>
     )
   }
   const percent = progress(job.completed, job.total)
@@ -142,7 +186,7 @@ function JobItem({ job }: { job: Job }) {
           variant='ghost'
           className='-mt-1'
           aria-label={t('activity.stop')}
-          onClick={() => void call(commands.stopJob, job.id).catch(() => undefined)}
+          onClick={stop}
         >
           <Square className='size-2.5 fill-current' />
         </Button>
@@ -154,6 +198,23 @@ function JobItem({ job }: { job: Job }) {
         {job.model ? (
           <p className='col-start-2 col-end-4 truncate text-[10px] text-muted-foreground'>
             {job.model}
+          </p>
+        ) : null}
+        {job.skipped + job.failed > 0 ? (
+          <p className='col-start-2 col-end-4 text-[10px] text-muted-foreground'>
+            {job.skipped > 0
+              ? t('activity.skipped', {
+                  count: job.skipped,
+                  defaultValue: `${job.skipped} skipped`,
+                })
+              : null}
+            {job.skipped > 0 && job.failed > 0 ? ' · ' : null}
+            {job.failed > 0
+              ? t('activity.failedCount', {
+                  count: job.failed,
+                  defaultValue: `${job.failed} failed`,
+                })
+              : null}
           </p>
         ) : null}
         <div className='col-start-2 col-end-4'>

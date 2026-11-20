@@ -14,6 +14,7 @@ const textLayer: Extract<Layer, { type: 'text' }> = {
     id: 'content',
     source: { text: 'sample content', language: null },
     translation: null,
+    translation_complete: false,
     role: null,
     source_region: null,
   },

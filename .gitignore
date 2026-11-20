@@ -1,19 +1,43 @@
-# Logs
-logs
+# Logs and diagnostics
+logs/
+**/logs/
 *.log
 npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 pnpm-debug.log*
 lerna-debug.log*
+*.etl
+*.dmp
+*.core
 
-node_modules
-dist
-dist-ssr
+# Dependencies and generated build output
+node_modules/
+**/node_modules/
+target/
+**/target/
+.next/
+**/.next/
+.turbo/
+**/.turbo/
+.vite/
+**/.vite/
+.vitest-cache/
+**/.vitest-cache/
+dist/
+**/dist/
+dist-ssr/
+build/
+**/build/
+out/
+**/out/
+coverage/
+**/coverage/
+*.tsbuildinfo
 *.local
 
-# Editor directories and files
-.idea
+# Editor and operating-system files
+.idea/
 .DS_Store
 *.suo
 *.ntvs*
@@ -21,35 +45,63 @@ dist-ssr
 *.sln
 *.sw?
 
+# Local project data and models
+/data/
+/projects/
+/imports/
+/user-data/
+/runs/
+/models/
 
-# Added by cargo
-
-target/
-
-# Datasets
-/data
-
-# model results
-/runs
-
-# model checkpoints
-/models
+# Local credentials and signing material
 .env
+.env.*
+!.env.example
+!.env.*.example
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.*.example
+*.pem
+*.key
+*.p12
+*.pfx
+*.p7b
+*.p7c
+*.jks
+*.keystore
+
+# Local databases and installer output
+*.sqlite
+*.sqlite3
+*.db
+*.msi
+*-setup.exe
+/installers/
 
 # Python
 .venv/
+__pycache__/
+*.py[cod]
 
-# Tauri
+# Tauri-generated permissions and schemas
 gen/
 
-# Temporary files
+# Temporary files and test output
 temp/
 tmp/
+**/temp/
+**/tmp/
 playwright-report/
 test-results/
-
-# integration-tests shared runtime cache
 .cache/
+**/.cache/
+.pytest_cache/
+**/.pytest_cache/
+.mypy_cache/
+**/.mypy_cache/
+.ruff_cache/
+**/.ruff_cache/
 
 # SponsorKit runtime cache (the generated SVG is tracked)
 .cache.json
@@ -60,6 +112,4 @@ test-results/
 
 # Local backups
 *.backup
-
-# Local backups
-*.backup
+*.bak
